@@ -53,6 +53,10 @@
     </div>
   </div>
 </div>
+<div id="leaderboard" style="position:fixed; top:16px; right:16px; width:240px; padding:12px; background:rgba(0,0,0,.6); color:#fff; font-family:system-ui; border-radius:12px;">
+  <div style="font-weight:700; margin-bottom:8px;">TOP 10</div>
+  <ol id="leaderboardList" style="margin:0; padding-left:18px;"></ol>
+</div>
 
 <script>
 (() => {
@@ -114,6 +118,7 @@
   const residualMomentum = { dirX: 0, dirY: -1, strength: 0 };
   let playerFacing = 1; // 1:right, -1:left
   let jumpStretchUntil = 0;
+  let rankSubmittedThisRound = false;
 
   function isFullyStopped(){
     return player.onGround && Math.abs(player.vx) < STATIC_VX_EPS && Math.abs(player.vy) < STATIC_VY_EPS;
@@ -658,6 +663,7 @@
       if (frozenElapsedSec === null) frozenElapsedSec = Math.floor((performance.now() - t0) / 1000);
       input.aiming = false;
       input.pid = null;
+      submitRankOnGameOver();
     } else {
       frozenElapsedSec = null;
     }
@@ -667,6 +673,29 @@
     const H = canvas.clientHeight;
     const outBelow = (player.y - cam.y) > (H + BOTTOM_OUT_MARGIN);
     if (outBelow) setGameOver(true);
+  }
+
+  async function submitRankOnGameOver(){
+    if (rankSubmittedThisRound) return;
+    rankSubmittedThisRound = true;
+
+    const name = prompt("이름 입력 (12자 이내)");
+    if (!name) return;
+
+    const submit = window.leaderboardSubmit;
+    if (typeof submit !== 'function'){
+      console.warn('leaderboardSubmit is not ready');
+      alert("랭킹 모듈이 아직 준비되지 않았어요. URL/KEY 또는 네트워크를 확인해줘.");
+      return;
+    }
+
+    const res = await submit(name, score());
+    if (!res?.ok){
+      const msg = typeof res?.error === 'string'
+        ? res.error
+        : (res?.error?.message || JSON.stringify(res?.error || {}));
+      alert(`저장 실패: ${msg}`);
+    }
   }
 
   function resetGame(){
@@ -691,7 +720,9 @@
     residualMomentum.strength = 0;
     jumpStretchUntil = 0;
     playerFacing = 1;
+    rankSubmittedThisRound = false;
     setGameOver(false);
+    if (typeof window.leaderboardRefresh === 'function') window.leaderboardRefresh();
   }
 
   restartBtn.addEventListener('click', resetGame);
@@ -807,6 +838,64 @@ POS    (${player.x.toFixed(0)}, ${player.y.toFixed(0)})`;
   generatePlatformsUpTo(player.y - canvas.clientHeight * 2.2);
   requestAnimationFrame(tick);
 })();
+</script>
+<script type="module">
+  import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+  const SUPABASE_URL = "https://bemuemmhdurymuqkvfzr.supabase.co";
+  const SUPABASE_ANON_KEY = "sb_publishable_zQDh_XUbi9EdWsWk64faRQ_OUp9bNqb";
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  const listEl = document.getElementById("leaderboardList");
+
+  function esc(s){
+    return String(s).replace(/[&<>"']/g, m => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+    }[m]));
+  }
+
+  async function fetchTop10(){
+    const { data, error } = await supabase
+      .from("leaderboard")
+      .select("name,score,created_at")
+      .order("score", { ascending: false })
+      .order("created_at", { ascending: true })
+      .limit(10);
+
+    if (error) {
+      console.error("fetchTop10 error:", error);
+      return;
+    }
+
+    listEl.innerHTML = data.map(row =>
+      `<li>${esc(row.name)} — <b>${row.score}</b></li>`
+    ).join("");
+  }
+
+  // 게임 시작 시 1회 로드
+  fetchTop10();
+
+  // 아래 함수들을 window에 달아두면, 기존 게임 코드에서 호출하기 편함
+  window.leaderboardSubmit = async function(name, score){
+    const cleanedName = String(name).trim().slice(0, 12);
+    const cleanedScore = Math.max(0, Math.floor(Number(score) || 0));
+
+    if (!cleanedName) return { ok:false, error:"name empty" };
+
+    const { error } = await supabase
+      .from("leaderboard")
+      .insert([{ name: cleanedName, score: cleanedScore }]);
+
+    if (error) {
+      console.error("insert error:", error);
+      return { ok:false, error: error.message || String(error) };
+    }
+
+    await fetchTop10();
+    return { ok:true };
+  };
+
+  window.leaderboardRefresh = fetchTop10;
 </script>
 </body>
 </html>
