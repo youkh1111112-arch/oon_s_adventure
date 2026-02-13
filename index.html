@@ -44,6 +44,18 @@
       padding:11px 18px; border-radius:10px; cursor:pointer;
     }
     .restart-btn:hover{ background:#24397e; }
+    body.force-mobile #leaderboard{
+      top:10px !important;
+      right:10px !important;
+      width:170px !important;
+      padding:8px !important;
+      border-radius:10px !important;
+      font-size:12px !important;
+    }
+    body.force-mobile #leaderboardList{
+      padding-left:14px !important;
+      font-size:12px !important;
+    }
     #storyToast{
       position:fixed;
       left:50%;
@@ -277,6 +289,20 @@
   const MAIN_ROUTE_RETRY = 28;
   const MAIN_ROUTE_DEBUG = false;
   const MAIN_DY_DEBUG = false;
+  const FORCE_MOBILE_VIEW = true;
+  const MOBILE_MAIN_MIN_DY_HARD = 130;
+  const MOBILE_MAIN_REROLL_MAX = 20;
+  const MOBILE_MAIN_MAX_DY_SAFE = 182;
+  const MOBILE_MAIN_MIN_SHIFT_HARD = 96;
+  const DESKTOP_MAIN_MIN_SHIFT_HARD = 72;
+  const MOBILE_MAIN_MIN_EDGE_GAP = 30;
+  const DESKTOP_MAIN_MIN_EDGE_GAP = 18;
+  const MOBILE_MAIN_MAX_W_SCREEN_RATIO = 0.56;
+  const DESKTOP_MAIN_MAX_W_SCREEN_RATIO = 0.62;
+  const MOBILE_SUB_MAX_W_SCREEN_RATIO = 0.52;
+  const DESKTOP_SUB_MAX_W_SCREEN_RATIO = 0.58;
+  const BLOCKING_CEILING_DY = 120;
+  const BLOCKING_CEILING_OVERLAP_RATIO = 0.58;
   const mainRouteRecent = [];
   const mainDyRecent = { mobile: [], desktop: [] };
 
@@ -285,8 +311,9 @@
   function lerp(a,b,t){ return a + (b - a) * t; }
   function worldCenterX(){ return (WORLD_MIN_X + WORLD_MAX_X) * 0.5; }
   function isMobileMode(){
-    return matchMedia("(max-width: 900px)").matches || /iPhone|Android/i.test(navigator.userAgent);
+    return FORCE_MOBILE_VIEW || matchMedia("(max-width: 900px)").matches || /iPhone|Android/i.test(navigator.userAgent);
   }
+  if (FORCE_MOBILE_VIEW) document.body.classList.add('force-mobile');
   function updateWorldBounds(){
     const W = viewportW || Math.round(window.innerWidth);
     // 중앙 고정 플레이필드를 없애고 화면 전체를 플레이 영역으로 사용
@@ -382,6 +409,36 @@
     return false;
   }
 
+  function isBlockingCeiling(from, candidate){
+    const upwardDy = from.y - candidate.y;
+    if (upwardDy <= 0 || upwardDy > BLOCKING_CEILING_DY) return false;
+    const overlapX = Math.max(0, Math.min(from.x + from.w, candidate.x + candidate.w) - Math.max(from.x, candidate.x));
+    const overlapNeed = Math.min(from.w, candidate.w) * BLOCKING_CEILING_OVERLAP_RATIO;
+    return overlapX >= overlapNeed;
+  }
+
+  function snapshotMainGenState(){
+    return {
+      lastPlatformX,
+      mainPlatformCount,
+      lastMainSide,
+      lastMainPlatform: lastMainPlatform ? { ...lastMainPlatform } : null,
+      routeLen: mainRouteRecent.length,
+      mobileDyLen: mainDyRecent.mobile.length,
+      desktopDyLen: mainDyRecent.desktop.length
+    };
+  }
+
+  function restoreMainGenState(snapshot){
+    lastPlatformX = snapshot.lastPlatformX;
+    mainPlatformCount = snapshot.mainPlatformCount;
+    lastMainSide = snapshot.lastMainSide;
+    lastMainPlatform = snapshot.lastMainPlatform ? { ...snapshot.lastMainPlatform } : null;
+    mainRouteRecent.length = snapshot.routeLen;
+    mainDyRecent.mobile.length = snapshot.mobileDyLen;
+    mainDyRecent.desktop.length = snapshot.desktopDyLen;
+  }
+
   function spawnMainPlatform(y, opts = {}){
     const anchor = lastMainPlatform;
     const center = worldCenterX();
@@ -396,9 +453,15 @@
     if (bucket < 0.24) w = rand(lerp(180, 130, difficulty), lerp(250, 190, difficulty));
     else if (bucket < 0.74) w = rand(lerp(130, 92, difficulty), lerp(185, 140, difficulty));
     else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty));
-    if (isMobile){
+    {
       const playW = WORLD_MAX_X - WORLD_MIN_X;
-      w = clamp(w * rand(1.15, 1.30), 90, Math.max(165, playW * 0.62));
+      const climbRatio = clamp(climb / 3600, 0, 1);
+      if (isMobile){
+        w = clamp(w * rand(1.10, 1.22), 86, Math.max(132, playW * 0.52));
+      }
+      const screenCapRatio = isMobile ? MOBILE_MAIN_MAX_W_SCREEN_RATIO : DESKTOP_MAIN_MAX_W_SCREEN_RATIO;
+      const hardCap = playW * lerp(screenCapRatio, screenCapRatio - 0.14, climbRatio);
+      w = Math.min(w, hardCap);
     }
 
     // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
@@ -416,8 +479,11 @@
     const anchorCx = anchor.x + anchor.w * 0.5;
     const maxDxRaw = getReachMaxDx(upwardDy, difficulty);
     const maxDx = Math.max(MAIN_MIN_SHIFT + 8, maxDxRaw - 8);
+    const routeMinShiftWanted = isMobile ? MOBILE_MAIN_MIN_SHIFT_HARD : DESKTOP_MAIN_MIN_SHIFT_HARD;
+    const routeMinShift = clamp(routeMinShiftWanted, 28, Math.max(30, maxDx - 10));
+    const routeMinEdgeGap = isMobile ? MOBILE_MAIN_MIN_EDGE_GAP : DESKTOP_MAIN_MIN_EDGE_GAP;
     const minDxBase = getPreferredMinDx(upwardDy, difficulty);
-    const minDx = clamp(Math.max(MAIN_MIN_SHIFT, minDxBase), MAIN_MIN_SHIFT, Math.max(MAIN_MIN_SHIFT + 6, maxDx - 8));
+    const minDx = clamp(Math.max(routeMinShift, minDxBase), routeMinShift, Math.max(routeMinShift + 6, maxDx - 8));
     const preferredSide = lastMainSide === 0 ? (Math.random() < 0.5 ? -1 : 1) : -lastMainSide;
     const sides = [preferredSide, -preferredSide];
 
@@ -431,7 +497,10 @@
       const nx = clamp(targetCx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
       const c = makePlatform(nx, y, w, 16);
       const shift = Math.abs((c.x + c.w * 0.5) - anchorCx);
-      if (shift < MAIN_MIN_SHIFT) continue;
+      const edgeGap = horizontalGapBetween(anchor, c);
+      if (shift < routeMinShift) continue;
+      if (edgeGap < routeMinEdgeGap) continue;
+      if (isBlockingCeiling(anchor, c)) continue;
       if (overlapsAnyPlatform(c, 8)) continue;
       if (!isReachableFrom(anchor, c, difficulty)) continue;
       candidate = c;
@@ -442,7 +511,7 @@
     // 실패 시 dy/dx를 줄여서라도 반드시 도달 가능한 메인 루트 확보
     if (!candidate){
       for (let relax = 0; relax < 12 && !candidate; relax++){
-        const softDy = clamp(upwardDy - relax * 6, 72, upwardDy);
+        const softDy = clamp(upwardDy - relax * 6, tuneMinDy, upwardDy);
         const softMaxDx = Math.max(40, getReachMaxDx(softDy, difficulty) - 6);
         const softMinDx = clamp(minDx * (0.92 - relax * 0.03), 36, softMaxDx - 4);
         const py = anchor.y - softDy;
@@ -451,7 +520,10 @@
           const nx = clamp(anchorCx + side * dx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
           const c = makePlatform(nx, py, w, 16);
           const shift = Math.abs((c.x + c.w * 0.5) - anchorCx);
-          if (shift < 34) continue;
+          const edgeGap = horizontalGapBetween(anchor, c);
+          if (shift < Math.max(34, routeMinShift * 0.72)) continue;
+          if (edgeGap < Math.max(14, routeMinEdgeGap * 0.66)) continue;
+          if (isBlockingCeiling(anchor, c)) continue;
           if (overlapsAnyPlatform(c, 8)) continue;
           if (!isReachableFrom(anchor, c, difficulty)) continue;
           candidate = c;
@@ -464,9 +536,9 @@
     // 마지막 안전장치: 반드시 통과 가능한 위치를 한 번 더 보장
     if (!candidate){
       const side = preferredSide;
-      const safeDy = clamp(upwardDy, 76, 118);
+      const safeDy = clamp(upwardDy, tuneMinDy, Math.max(tuneMinDy, 118));
       const safeMaxDx = Math.max(44, getReachMaxDx(safeDy, difficulty) - 8);
-      const safeDx = clamp(Math.min(Math.max(MAIN_MIN_SHIFT, minDx), safeMaxDx - 4), 36, safeMaxDx);
+      const safeDx = clamp(Math.min(Math.max(routeMinShift, minDx), safeMaxDx - 4), 36, safeMaxDx);
       const py = anchor.y - safeDy;
       const nx = clamp(anchorCx + side * safeDx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
       candidate = makePlatform(nx, py, w, 16);
@@ -484,14 +556,16 @@
 
     if (!candidate || overlapsAnyPlatform(candidate, 8) || !isReachableFrom(anchor, candidate, difficulty)){
       let forced = null;
-      for (let dyTry = 108; dyTry >= 64 && !forced; dyTry -= 6){
+      for (let dyTry = Math.max(108, tuneMinDy); dyTry >= tuneMinDy && !forced; dyTry -= 6){
         const py = anchor.y - dyTry;
         const maxDxTry = Math.max(30, getReachMaxDx(dyTry, difficulty) - 4);
-        const minDxTry = Math.min(Math.max(24, MAIN_MIN_SHIFT - 24), maxDxTry - 2);
+        const minDxTry = Math.min(Math.max(24, routeMinShift - 24), maxDxTry - 2);
         for (const side of sides){
           for (let dxTry = maxDxTry; dxTry >= minDxTry; dxTry -= 6){
             const nx = clamp(anchorCx + side * dxTry - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
             const c = makePlatform(nx, py, w, 16);
+            const edgeGap = horizontalGapBetween(anchor, c);
+            if (edgeGap < Math.max(10, routeMinEdgeGap * 0.5)) continue;
             if (overlapsAnyPlatform(c, 8)) continue;
             if (!isReachableFrom(anchor, c, difficulty)) continue;
             forced = c;
@@ -505,7 +579,7 @@
     }
 
     if (!candidate){
-      const py = anchor.y - 72;
+      const py = anchor.y - tuneMinDy;
       const nx = clamp(anchorCx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
       candidate = makePlatform(nx, py, w, 16);
       chosenSide = preferredSide;
@@ -547,60 +621,67 @@
       const baseMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
       const baseMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), baseMinDy + 16, MAIN_MAX_DY);
       const safeTop = REACH_MAX_DY - 8;
-      let boostScale = 1;
-      if (isMobile){
-        boostScale = rand(1.45, 1.75);
-      }
-      const dyBase = rand(baseMinDy, baseMaxDy) * boostScale;
-      const factors = isMobile ? [1.0, 0.9, 0.8, 0.7] : [1.0];
+      const mobileScaledMin = clamp(baseMinDy * 1.45, MOBILE_MAIN_MIN_DY_HARD, safeTop - 14);
+      const mobileScaledMax = clamp(baseMaxDy * 1.75, mobileScaledMin + 10, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE));
+      const recent3 = mainDyRecent.mobile.slice(-3);
+      const smallCount = recent3.filter((v) => v < 150).length;
+      const forceLargeDy = isMobile && smallCount >= 2;
+      const dyMin = isMobile
+        ? (forceLargeDy ? clamp(160, MOBILE_MAIN_MIN_DY_HARD, Math.min(safeTop - 8, MOBILE_MAIN_MAX_DY_SAFE - 14)) : mobileScaledMin)
+        : baseMinDy;
+      const dyMax = isMobile
+        ? (forceLargeDy ? clamp(184, dyMin + 4, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE)) : mobileScaledMax)
+        : baseMaxDy;
+
       let main = null;
+      let attempts = 0;
+      for (let i = 0; i < (isMobile ? MOBILE_MAIN_REROLL_MAX : 1); i++){
+        attempts = i + 1;
+        const snapshot = snapshotMainGenState();
+        const dy = rand(dyMin, dyMax);
+        nextPlatformY = anchorY - dy;
 
-      for (const factor of factors){
-        const tuneMinDy = isMobile
-          ? clamp(baseMinDy * boostScale * factor, 88, safeTop - 16)
-          : baseMinDy;
-        const tuneMaxDy = isMobile
-          ? clamp(baseMaxDy * boostScale * factor, tuneMinDy + 10, safeTop)
-          : baseMaxDy;
-        const dy = clamp(dyBase * factor, tuneMinDy, tuneMaxDy);
-        const targetY = anchorY - dy;
-
-        // spawnMainPlatform 내부 상태 변경이 있기 때문에, 실패 시 롤백할 수 있게 스냅샷 저장
-        const snapshot = {
-          lastPlatformX,
-          mainPlatformCount,
-          lastMainSide,
-          lastMainPlatform: lastMainPlatform ? { ...lastMainPlatform } : null,
-          routeLen: mainRouteRecent.length,
-          mobileDyLen: mainDyRecent.mobile.length,
-          desktopDyLen: mainDyRecent.desktop.length
-        };
-
-        const candidate = spawnMainPlatform(targetY, { minDy: tuneMinDy, maxDy: tuneMaxDy, isMobile });
-        const anchor = snapshot.lastMainPlatform;
-        const reachable = !anchor || isReachableFrom(anchor, candidate, difficulty);
-        if (reachable){
-          main = candidate;
-          break;
+        const candidate = spawnMainPlatform(nextPlatformY, {
+          minDy: isMobile ? MOBILE_MAIN_MIN_DY_HARD : baseMinDy,
+          maxDy: dyMax,
+          isMobile
+        });
+        const actualDy = anchorY - candidate.y;
+        const reachable = !snapshot.lastMainPlatform || isReachableFrom(snapshot.lastMainPlatform, candidate, difficulty);
+        if (!reachable){
+          restoreMainGenState(snapshot);
+          if (isMobile) console.log('[main-mobile] reroll reason: unreachable');
+          continue;
         }
-
-        // fallback 단계로 내려가기 전 상태 복원
-        lastPlatformX = snapshot.lastPlatformX;
-        mainPlatformCount = snapshot.mainPlatformCount;
-        lastMainSide = snapshot.lastMainSide;
-        lastMainPlatform = snapshot.lastMainPlatform ? { ...snapshot.lastMainPlatform } : null;
-        mainRouteRecent.length = snapshot.routeLen;
-        mainDyRecent.mobile.length = snapshot.mobileDyLen;
-        mainDyRecent.desktop.length = snapshot.desktopDyLen;
+        if (isMobile && actualDy < MOBILE_MAIN_MIN_DY_HARD){
+          restoreMainGenState(snapshot);
+          console.log('[main-mobile] reroll reason: dy too small');
+          continue;
+        }
+        main = candidate;
+        break;
       }
 
       if (!main){
-        // 모든 모바일 fallback 실패 시 기본 범위로 보수적 재생성
-        const safeDy = rand(baseMinDy, baseMaxDy);
-        main = spawnMainPlatform(anchorY - safeDy, { minDy: baseMinDy, maxDy: baseMaxDy, isMobile });
+        // Hard correction: force at least dy 130 on mobile.
+        const forcedDy = isMobile ? MOBILE_MAIN_MIN_DY_HARD : baseMinDy;
+        nextPlatformY = anchorY - forcedDy;
+        main = spawnMainPlatform(nextPlatformY, {
+          minDy: forcedDy,
+          maxDy: forcedDy,
+          isMobile
+        });
+        attempts = Math.max(attempts, isMobile ? MOBILE_MAIN_REROLL_MAX : 1);
       }
 
       nextPlatformY = main.y;
+      if (isMobile){
+        const actualDy = Math.round(anchorY - main.y);
+        console.log(
+          `[main-mobile] dy:${actualDy} w:${Math.round(main.w)} x:${Math.round(main.x)} ` +
+          `y:${Math.round(main.y)} attempts:${attempts}`
+        );
+      }
       if (!main.keep && mainPlatformCount > 7){
         const crumbleChance = lerp(0.11, 0.23, difficulty);
         if (Math.random() < crumbleChance) main.crumble = true;
@@ -610,23 +691,51 @@
 
       // 고도 상승 시에도 보조 발판 확률 하한을 높여 밀도 유지
       const subChanceBase = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
-      const subChance = isMobile ? clamp(subChanceBase * 0.55, 0.08, 0.36) : subChanceBase;
-      if (Math.random() < subChance){
-        const w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
+      const subChance = isMobile ? clamp(subChanceBase * 1.18, 0.30, 0.78) : subChanceBase;
+      const subRolls = isMobile ? 2 : 1;
+      for (let subIndex = 0; subIndex < subRolls; subIndex++){
+        if (Math.random() >= subChance) continue;
+        let w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
+        {
+          const playW = WORLD_MAX_X - WORLD_MIN_X;
+          const climbRatio = clamp(climbNow / 3600, 0, 1);
+          if (isMobile){
+            const cap = playW * lerp(MOBILE_SUB_MAX_W_SCREEN_RATIO, MOBILE_SUB_MAX_W_SCREEN_RATIO - 0.12, climbRatio);
+            w = Math.min(w, cap);
+          } else {
+            const cap = playW * lerp(DESKTOP_SUB_MAX_W_SCREEN_RATIO, DESKTOP_SUB_MAX_W_SCREEN_RATIO - 0.10, climbRatio);
+            w = Math.min(w, cap);
+          }
+        }
         const y = nextPlatformY + rand(-18, 18);
-        let x = rand(spawnMinX() + 2, spawnMaxX(w) - 2);
+        let x;
+        if (isMobile){
+          const mainCy = main.x + main.w * 0.5;
+          const upwardDyFromMain = clamp(Math.max(24, main.y - y), 24, REACH_MAX_DY);
+          const subMaxDx = Math.max(52, getReachMaxDx(upwardDyFromMain, difficulty) * 0.95);
+          const subMinDx = Math.min(84, Math.max(36, subMaxDx * 0.38));
+          const side = Math.random() < 0.5 ? -1 : 1;
+          const cx = mainCy + side * rand(subMinDx, subMaxDx);
+          x = clamp(cx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+        } else {
+          x = rand(spawnMinX() + 2, spawnMaxX(w) - 2);
+        }
         const mainCenter = main.x + main.w * 0.5;
         const subCenter = x + w * 0.5;
-        if (Math.abs(subCenter - mainCenter) < 200){
+        if (!isMobile && Math.abs(subCenter - mainCenter) < 200){
           x = subCenter < mainCenter
             ? clamp(main.x - rand(240, 340), spawnMinX() + 2, spawnMaxX(w) - 2)
             : clamp(main.x + rand(240, 340), spawnMinX() + 2, spawnMaxX(w) - 2);
         }
         const sub = makePlatform(x, y, w, 14, { crumble: Math.random() < 0.34 && mainPlatformCount > 7 });
+        if (isBlockingCeiling(main, sub)) continue;
         let placeable = !overlapsAnyPlatform(sub, 8);
         for (let tries = 0; tries < 10 && !placeable; tries++){
           sub.x = rand(spawnMinX() + 2, spawnMaxX(sub.w) - 2);
           placeable = !overlapsAnyPlatform(sub, 8);
+        }
+        if (placeable && isMobile){
+          placeable = hasReachableAnchor(sub, difficulty) || isReachableFrom(main, sub, difficulty);
         }
         if (placeable){
           maybeAssignItem(sub, difficulty);
