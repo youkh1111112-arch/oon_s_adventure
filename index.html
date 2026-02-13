@@ -440,6 +440,35 @@
     return overlapX >= overlapNeed;
   }
 
+  function pathCenterXAtY(from, to, y){
+    const fromCx = from.x + from.w * 0.5;
+    const toCx = to.x + to.w * 0.5;
+    const totalDy = Math.max(1, from.y - to.y);
+    const t = clamp((from.y - y) / totalDy, 0, 1);
+    return lerp(fromCx, toCx, t);
+  }
+
+  // Checks whether a platform would block the ascent corridor from "from" to "to".
+  function blocksAscentPath(from, to, pl, pad = 10){
+    if (pl.broken) return false;
+    const lowY = Math.min(from.y, to.y);
+    const highY = Math.max(from.y, to.y);
+    if (pl.y > highY || pl.y + pl.h < lowY) return false;
+
+    const sampleY = clamp(pl.y + pl.h * 0.5, lowY, highY);
+    const pathCx = pathCenterXAtY(from, to, sampleY);
+    return pathCx >= (pl.x - pad) && pathCx <= (pl.x + pl.w + pad);
+  }
+
+  function routeBlockedByAnyPlatform(from, to, ignoreSet = null){
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (ignoreSet && ignoreSet.has(pl)) continue;
+      if (blocksAscentPath(from, to, pl, 12)) return true;
+    }
+    return false;
+  }
+
   function snapshotMainGenState(){
     return {
       lastPlatformX,
@@ -526,6 +555,7 @@
       if (isBlockingCeiling(anchor, c)) continue;
       if (overlapsAnyPlatform(c, 8)) continue;
       if (!isReachableFrom(anchor, c, difficulty)) continue;
+      if (routeBlockedByAnyPlatform(anchor, c, new Set([anchor]))) continue;
       candidate = c;
       chosenSide = side;
       break;
@@ -549,6 +579,7 @@
           if (isBlockingCeiling(anchor, c)) continue;
           if (overlapsAnyPlatform(c, 8)) continue;
           if (!isReachableFrom(anchor, c, difficulty)) continue;
+          if (routeBlockedByAnyPlatform(anchor, c, new Set([anchor]))) continue;
           candidate = c;
           chosenSide = side;
           break;
@@ -658,6 +689,7 @@
 
       let main = null;
       let attempts = 0;
+      const prevMainForRoute = lastMainPlatform ? { ...lastMainPlatform } : null;
       for (let i = 0; i < (isMobile ? MOBILE_MAIN_REROLL_MAX : 1); i++){
         attempts = i + 1;
         const snapshot = snapshotMainGenState();
@@ -730,7 +762,9 @@
             w = Math.min(w, cap);
           }
         }
-        const y = nextPlatformY + rand(-18, 18);
+        const y = isMobile
+          ? (nextPlatformY + rand(6, 26))
+          : (nextPlatformY + rand(-18, 18));
         if (isMobile && countPlatformsInYBand(y, MOBILE_SUB_BAND_DY) >= MOBILE_SUB_BAND_MAX){
           continue;
         }
@@ -756,6 +790,7 @@
         const sub = makePlatform(x, y, w, 14, { crumble: Math.random() < 0.34 && mainPlatformCount > 7 });
         if (isBlockingCeiling(main, sub)) continue;
         if (isMobile && isBlockingMainRoute(main, sub)) continue;
+        if (isMobile && prevMainForRoute && blocksAscentPath(prevMainForRoute, main, sub, 12)) continue;
         let placeable = !overlapsAnyPlatform(sub, 8);
         for (let tries = 0; tries < 10 && !placeable; tries++){
           sub.x = rand(spawnMinX() + 2, spawnMaxX(sub.w) - 2);
