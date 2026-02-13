@@ -303,6 +303,12 @@
   const DESKTOP_SUB_MAX_W_SCREEN_RATIO = 0.58;
   const BLOCKING_CEILING_DY = 120;
   const BLOCKING_CEILING_OVERLAP_RATIO = 0.58;
+  const MOBILE_SUB_ROLLS_MAX = 1;
+  const MOBILE_SUB_BAND_DY = 54;
+  const MOBILE_SUB_BAND_MAX = 2;
+  const MOBILE_ROUTE_BLOCK_DY_MIN = 26;
+  const MOBILE_ROUTE_BLOCK_DY_MAX = 170;
+  const MOBILE_ROUTE_BLOCK_OVERLAP_RATIO = 0.46;
   const mainRouteRecent = [];
   const mainDyRecent = { mobile: [], desktop: [] };
 
@@ -414,6 +420,23 @@
     if (upwardDy <= 0 || upwardDy > BLOCKING_CEILING_DY) return false;
     const overlapX = Math.max(0, Math.min(from.x + from.w, candidate.x + candidate.w) - Math.max(from.x, candidate.x));
     const overlapNeed = Math.min(from.w, candidate.w) * BLOCKING_CEILING_OVERLAP_RATIO;
+    return overlapX >= overlapNeed;
+  }
+
+  function countPlatformsInYBand(y, bandDy){
+    let count = 0;
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (Math.abs(pl.y - y) <= bandDy) count += 1;
+    }
+    return count;
+  }
+
+  function isBlockingMainRoute(main, candidate){
+    const upwardDy = main.y - candidate.y;
+    if (upwardDy < MOBILE_ROUTE_BLOCK_DY_MIN || upwardDy > MOBILE_ROUTE_BLOCK_DY_MAX) return false;
+    const overlapX = Math.max(0, Math.min(main.x + main.w, candidate.x + candidate.w) - Math.max(main.x, candidate.x));
+    const overlapNeed = Math.min(main.w, candidate.w) * MOBILE_ROUTE_BLOCK_OVERLAP_RATIO;
     return overlapX >= overlapNeed;
   }
 
@@ -692,7 +715,7 @@
       // 고도 상승 시에도 보조 발판 확률 하한을 높여 밀도 유지
       const subChanceBase = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
       const subChance = isMobile ? clamp(subChanceBase * 1.18, 0.30, 0.78) : subChanceBase;
-      const subRolls = isMobile ? 2 : 1;
+      const subRolls = isMobile ? MOBILE_SUB_ROLLS_MAX : 1;
       for (let subIndex = 0; subIndex < subRolls; subIndex++){
         if (Math.random() >= subChance) continue;
         let w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
@@ -708,6 +731,9 @@
           }
         }
         const y = nextPlatformY + rand(-18, 18);
+        if (isMobile && countPlatformsInYBand(y, MOBILE_SUB_BAND_DY) >= MOBILE_SUB_BAND_MAX){
+          continue;
+        }
         let x;
         if (isMobile){
           const mainCy = main.x + main.w * 0.5;
@@ -729,6 +755,7 @@
         }
         const sub = makePlatform(x, y, w, 14, { crumble: Math.random() < 0.34 && mainPlatformCount > 7 });
         if (isBlockingCeiling(main, sub)) continue;
+        if (isMobile && isBlockingMainRoute(main, sub)) continue;
         let placeable = !overlapsAnyPlatform(sub, 8);
         for (let tries = 0; tries < 10 && !placeable; tries++){
           sub.x = rand(spawnMinX() + 2, spawnMaxX(sub.w) - 2);
