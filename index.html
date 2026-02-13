@@ -44,6 +44,38 @@
       padding:11px 18px; border-radius:10px; cursor:pointer;
     }
     .restart-btn:hover{ background:#24397e; }
+    #storyToast{
+      position:fixed;
+      left:50%;
+      top:50%;
+      transform:translate(-50%, -50%) scale(0.98);
+      max-width:min(88vw, 700px);
+      padding:14px 22px;
+      border-radius:14px;
+      color:#f7fbff;
+      font:700 clamp(22px, 4.4vw, 42px)/1.22 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      letter-spacing:-0.01em;
+      text-align:center;
+      white-space:normal;
+      background:rgba(10, 17, 32, 0.52);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      text-shadow:0 2px 10px rgba(5, 8, 15, 0.7);
+      box-shadow:0 10px 34px rgba(0, 0, 0, 0.28);
+      opacity:0;
+      pointer-events:none;
+      z-index:30;
+      transition:opacity 0.2s ease-out, transform 0.2s ease-out;
+    }
+    #storyToast.show{
+      opacity:1;
+      transform:translate(-50%, -50%) scale(1);
+    }
+    #storyToast.hide{
+      opacity:0;
+      transform:translate(-50%, -50%) scale(1.01);
+      transition:opacity 0.4s ease-in, transform 0.4s ease-in;
+    }
     @media (max-width: 768px){
       #leaderboard{
         top:10px !important;
@@ -76,6 +108,7 @@
   <div style="font-weight:700; margin-bottom:8px;">TOP 5</div>
   <ol id="leaderboardList" style="margin:0; padding-left:18px;"></ol>
 </div>
+<div id="storyToast" aria-live="polite"></div>
 
 <script>
 (() => {
@@ -85,6 +118,7 @@
   const hud = document.getElementById('hud');
   const gameOverOverlay = document.getElementById('gameOverOverlay');
   const restartBtn = document.getElementById('restartBtn');
+  const storyToastEl = document.getElementById('storyToast');
 
   function DPR(){ return Math.max(1, Math.min(2, window.devicePixelRatio || 1)); }
   let viewportW = 0;
@@ -161,10 +195,44 @@
   let pickupPulseUntil = 0;
   let pickupText = '';
   let pickupTextUntil = 0;
+  let storyShown = false;
   const debrisParticles = [];
   const breakCrackFx = [];
   const spriteFxCanvas = document.createElement('canvas');
   const spriteFxCtx = spriteFxCanvas.getContext('2d');
+  const STORY_TOAST_TOTAL_MS = 1600;
+  const STORY_TOAST_HIDE_AT_MS = 1200;
+  let storyToastHideTimer = 0;
+  let storyToastEndTimer = 0;
+
+  function clearStoryToastTimers(){
+    if (storyToastHideTimer){
+      clearTimeout(storyToastHideTimer);
+      storyToastHideTimer = 0;
+    }
+    if (storyToastEndTimer){
+      clearTimeout(storyToastEndTimer);
+      storyToastEndTimer = 0;
+    }
+  }
+
+  function showStoryToast(text){
+    clearStoryToastTimers();
+    storyToastEl.textContent = text;
+    storyToastEl.classList.remove('show', 'hide');
+    // Restart CSS transition sequence for repeated calls.
+    void storyToastEl.offsetWidth;
+    storyToastEl.classList.add('show');
+
+    storyToastHideTimer = setTimeout(() => {
+      storyToastEl.classList.remove('show');
+      storyToastEl.classList.add('hide');
+    }, STORY_TOAST_HIDE_AT_MS);
+
+    storyToastEndTimer = setTimeout(() => {
+      storyToastEl.classList.remove('hide');
+    }, STORY_TOAST_TOTAL_MS);
+  }
 
   function isFullyStopped(){
     return player.onGround && Math.abs(player.vx) < STATIC_VX_EPS && Math.abs(player.vy) < STATIC_VY_EPS;
@@ -193,12 +261,17 @@
   const MAIN_MIN_SHIFT = 64;
   const MAIN_ROUTE_RETRY = 28;
   const MAIN_ROUTE_DEBUG = false;
+  const MAIN_DY_DEBUG = false;
   const mainRouteRecent = [];
+  const mainDyRecent = { mobile: [], desktop: [] };
 
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
   function rand(min, max){ return min + Math.random() * (max - min); }
   function lerp(a,b,t){ return a + (b - a) * t; }
   function worldCenterX(){ return (WORLD_MIN_X + WORLD_MAX_X) * 0.5; }
+  function isMobileMode(){
+    return matchMedia("(max-width: 900px)").matches || /iPhone|Android/i.test(navigator.userAgent);
+  }
   function updateWorldBounds(){
     const W = viewportW || Math.round(window.innerWidth);
     // 중앙 고정 플레이필드를 없애고 화면 전체를 플레이 영역으로 사용
@@ -294,17 +367,24 @@
     return false;
   }
 
-  function spawnMainPlatform(y){
+  function spawnMainPlatform(y, opts = {}){
     const anchor = lastMainPlatform;
     const center = worldCenterX();
     const climb = Math.max(0, SPAWN_Y - y);
     const difficulty = clamp(climb / 4200, 0, 1);
+    const isMobile = !!opts.isMobile;
+    const tuneMinDy = typeof opts.minDy === 'number' ? opts.minDy : MAIN_MIN_DY;
+    const tuneMaxDy = typeof opts.maxDy === 'number' ? opts.maxDy : MAIN_MAX_DY;
 
     let w;
     const bucket = Math.random();
     if (bucket < 0.24) w = rand(lerp(180, 130, difficulty), lerp(250, 190, difficulty));
     else if (bucket < 0.74) w = rand(lerp(130, 92, difficulty), lerp(185, 140, difficulty));
     else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty));
+    if (isMobile){
+      const playW = WORLD_MAX_X - WORLD_MIN_X;
+      w = clamp(w * rand(1.10, 1.25), 84, Math.max(150, playW * 0.58));
+    }
 
     // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
     if (!anchor){
@@ -317,7 +397,7 @@
       return fallback;
     }
 
-    const upwardDy = clamp(anchor.y - y, MAIN_MIN_DY, MAIN_MAX_DY);
+    const upwardDy = clamp(anchor.y - y, tuneMinDy, tuneMaxDy);
     const anchorCx = anchor.x + anchor.w * 0.5;
     const maxDxRaw = getReachMaxDx(upwardDy, difficulty);
     const maxDx = Math.max(MAIN_MIN_SHIFT + 8, maxDxRaw - 8);
@@ -420,8 +500,28 @@
     const dyLog = Math.round(anchor.y - candidate.y);
     mainRouteRecent.push({ dx: dxLog, dy: dyLog, side: chosenSide });
     if (mainRouteRecent.length > 10) mainRouteRecent.shift();
+    const dyMode = isMobile ? 'mobile' : 'desktop';
+    const dyBucket = mainDyRecent[dyMode];
+    dyBucket.push(dyLog);
+    if (dyBucket.length > 10) dyBucket.shift();
     if (MAIN_ROUTE_DEBUG){
       console.log('[main-route]', mainRouteRecent.map((m) => `dx:${m.dx} dy:${m.dy} side:${m.side > 0 ? 'R' : 'L'}`).join(' | '));
+    }
+    if (MAIN_DY_DEBUG){
+      const myAvg = dyBucket.reduce((a, b) => a + b, 0) / Math.max(1, dyBucket.length);
+      const otherMode = isMobile ? 'desktop' : 'mobile';
+      const otherBucket = mainDyRecent[otherMode];
+      const otherAvg = otherBucket.length
+        ? (otherBucket.reduce((a, b) => a + b, 0) / otherBucket.length)
+        : null;
+      const cmp = otherAvg === null
+        ? 'n/a'
+        : (myAvg > otherAvg ? 'true' : 'false');
+      console.log(
+        `[main-dy] mode:${dyMode} avg:${myAvg.toFixed(1)} ` +
+        `${otherMode}Avg:${otherAvg === null ? 'n/a' : otherAvg.toFixed(1)} ` +
+        `biggerThan${otherMode}:${cmp}`
+      );
     }
 
     lastPlatformX = candidate.x;
@@ -437,12 +537,28 @@
       const climbNow = Math.max(0, SPAWN_Y - anchorY);
       const difficulty = clamp(climbNow / 4200, 0, 1);
       const earlyDense = clamp((10 - mainPlatformCount) / 10, 0, 1);
-      const mainMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
-      const mainMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), mainMinDy + 16, MAIN_MAX_DY);
-      const dy = rand(mainMinDy, mainMaxDy);
+      const isMobile = isMobileMode();
+      const baseMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
+      const baseMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), baseMinDy + 16, MAIN_MAX_DY);
+
+      let mainMinDy = baseMinDy;
+      let mainMaxDy = baseMaxDy;
+      if (isMobile){
+        const minScale = lerp(1.35, 1.45, difficulty);
+        const maxScale = lerp(1.50, 1.60, difficulty);
+        const safeTop = REACH_MAX_DY - 8;
+        mainMinDy = clamp(baseMinDy * minScale, 96, safeTop - 20);
+        mainMaxDy = clamp(baseMaxDy * maxScale, mainMinDy + 12, safeTop);
+      }
+
+      let dy = rand(mainMinDy, mainMaxDy);
+      // 모바일에서 gap이 너무 커져 실패할 경우를 대비한 점진 축소 fallback
+      if (isMobile){
+        dy = clamp(dy, mainMinDy * 0.92, REACH_MAX_DY - 8);
+      }
       nextPlatformY = anchorY - dy;
 
-      const main = spawnMainPlatform(nextPlatformY);
+      const main = spawnMainPlatform(nextPlatformY, { minDy: mainMinDy, maxDy: mainMaxDy, isMobile });
       nextPlatformY = main.y;
       if (!main.keep && mainPlatformCount > 7){
         const crumbleChance = lerp(0.11, 0.23, difficulty);
@@ -452,7 +568,8 @@
       platforms.push(main);
 
       // 고도 상승 시에도 보조 발판 확률 하한을 높여 밀도 유지
-      const subChance = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
+      const subChanceBase = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
+      const subChance = isMobile ? clamp(subChanceBase * 0.6, 0.08, 0.42) : subChanceBase;
       if (Math.random() < subChance){
         const w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
         const y = nextPlatformY + rand(-18, 18);
@@ -684,6 +801,8 @@
   let startY = player.y;
   let bestY = player.y;
   let t0 = performance.now();
+  let hudOriginX = player.x;
+  let hudOriginY = player.y;
 
   function score(){
     return Math.max(0, Math.floor((startY - bestY) / 10));
@@ -1204,6 +1323,8 @@
     startY = player.y;
     bestY = player.y;
     t0 = performance.now();
+    hudOriginX = player.x;
+    hudOriginY = player.y;
     frozenElapsedSec = null;
 
     input.aiming = false;
@@ -1216,6 +1337,9 @@
     pickupPulseUntil = 0;
     pickupText = '';
     pickupTextUntil = 0;
+    storyShown = false;
+    clearStoryToastTimers();
+    storyToastEl.classList.remove('show', 'hide');
     debrisParticles.length = 0;
     breakCrackFx.length = 0;
     jumpStretchUntil = 0;
@@ -1253,6 +1377,11 @@
 
       generatePlatformsUpTo(cam.y - H * 1.8);
       cleanupPlatforms(H);
+
+      if (!storyShown && (hudOriginY - player.y) >= 1000){
+        storyShown = true;
+        showStoryToast('운이는 바다 바깥이 궁금했어요');
+      }
 
       checkGameOver();
     }
@@ -1380,7 +1509,7 @@
 `SCORE  ${score()}
 TIME   ${mm}:${ss}
 STATE  ${isGameOver ? 'GAME OVER' : (isFullyStopped() ? 'READY' : (player.onGround ? 'GROUND' : 'AIR'))}
-POS    (${player.x.toFixed(0)}, ${player.y.toFixed(0)})`;
+POS    (0, ${(hudOriginY - player.y).toFixed(0)})`;
   }
 
   updateWorldBounds();
