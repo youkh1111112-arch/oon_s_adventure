@@ -105,12 +105,21 @@
   const PLAYFIELD_TARGET_W = 640;
   const PLAYFIELD_MIN_W = 320;
   const PLAYFIELD_SIDE_MARGIN = 24;
+  const START_PLATFORM_W = 180;
+  const GROUND_PAD = 260;
+  const ITEM_BOB_AMP = 2.6;
+  const ITEM_BOB_SPEED = 0.0048;
+  const APPLE_BUFF_MS = 10000;
+  const BLUE_WEAK_MS = 10000;
+  const BLUE_JUMP_SCALE = 1.45;
+  const APPLE_BREAK_IMPACT = 170;
 
   // ===== World =====
   const player = {
     x: 0, y: SPAWN_Y, w: PLAYER_W, h: PLAYER_H,
     vx: 0, vy: 0,
-    onGround: false
+    onGround: false,
+    groundPlatform: null
   };
   const cam = { y: 0 };
   let isGameOver = false;
@@ -119,6 +128,13 @@
   let playerFacing = 1; // 1:right, -1:left
   let jumpStretchUntil = 0;
   let rankSubmittedThisRound = false;
+  let appleBuffUntil = 0;
+  let blueWeakUntil = 0;
+  let pickupPulseUntil = 0;
+  const debrisParticles = [];
+  const breakCrackFx = [];
+  const spriteFxCanvas = document.createElement('canvas');
+  const spriteFxCtx = spriteFxCanvas.getContext('2d');
 
   function isFullyStopped(){
     return player.onGround && Math.abs(player.vx) < STATIC_VX_EPS && Math.abs(player.vy) < STATIC_VY_EPS;
@@ -155,14 +171,13 @@
 
   function seedBasePlatforms(){
     const playW = WORLD_MAX_X - WORLD_MIN_X;
-    const groundPad = 260;
-    const startW = 180;
+    const startW = START_PLATFORM_W;
     const startX = clamp(worldCenterX() - startW * 0.5, WORLD_MIN_X + 24, WORLD_MAX_X - startW - 24);
 
     platforms.length = 0;
     platforms.push(
-      { x: WORLD_MIN_X - groundPad, y: 640, w: playW + groundPad * 2, h: 50, keep: true },
-      { x: startX, y: 560, w: startW, h: 16, keep: true }
+      { x: WORLD_MIN_X - GROUND_PAD, y: 640, w: playW + GROUND_PAD * 2, h: 50, keep: true, crumble: false, standTime: 0, broken: false },
+      { x: startX, y: 560, w: startW, h: 16, keep: true, crumble: false, standTime: 0, broken: false }
     );
 
     nextPlatformY = 560;
@@ -173,61 +188,109 @@
     player.y = SPAWN_Y;
   }
 
+  function spawnMinX(){ return WORLD_MIN_X - GROUND_PAD + 14; }
+  function spawnMaxX(width){ return WORLD_MAX_X + GROUND_PAD - width - 14; }
+
+  function makePlatform(x, y, w, h, opts = {}){
+    return {
+      x, y, w, h,
+      keep: !!opts.keep,
+      crumble: !!opts.crumble,
+      standTime: 0,
+      broken: false,
+      item: null
+    };
+  }
+
+  function overlapsAnyPlatform(candidate, padding = 6){
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (
+        candidate.x < pl.x + pl.w + padding &&
+        candidate.x + candidate.w > pl.x - padding &&
+        candidate.y < pl.y + pl.h + padding &&
+        candidate.y + candidate.h > pl.y - padding
+      ) return true;
+    }
+    return false;
+  }
+
   function spawnMainPlatform(y){
     const center = worldCenterX();
     const climb = Math.max(0, SPAWN_Y - y);
     const difficulty = clamp(climb / 4200, 0, 1);
-    const w = rand(lerp(160, 100, difficulty), lerp(230, 160, difficulty));
 
-    let x;
-    // 초반은 좌우 교차 배치로 쉽게 진행
-    if (mainPlatformCount < 10){
-      const nextSide = lastMainSide <= 0 ? 1 : -1;
-      const pad = 26;
-      if (nextSide < 0){
-        const maxLeft = Math.max(WORLD_MIN_X + pad, center - w - 34);
-        x = rand(WORLD_MIN_X + pad, maxLeft);
-      } else {
-        const minRight = Math.min(WORLD_MAX_X - w - pad, center + 34);
-        x = rand(minRight, WORLD_MAX_X - w - pad);
-      }
-      lastMainSide = nextSide;
-    } else {
-      const drift = rand(lerp(130, 220, difficulty), lerp(240, 340, difficulty));
-      const dir = Math.random() < 0.5 ? -1 : 1;
-      const rawX = lastPlatformX + dir * drift;
-      x = clamp(rawX, WORLD_MIN_X + 18, WORLD_MAX_X - w - 18);
-      lastMainSide = (x + w * 0.5) < center ? -1 : 1;
+    let w;
+    const bucket = Math.random();
+    if (bucket < 0.24) w = rand(lerp(180, 130, difficulty), lerp(250, 190, difficulty)); // wide
+    else if (bucket < 0.74) w = rand(lerp(130, 92, difficulty), lerp(185, 140, difficulty)); // mid
+    else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty)); // narrow
+
+    const roam = lerp(120, 290, difficulty);
+    let x = clamp(
+      lastPlatformX + rand(-roam, roam) * 0.62 + (center + rand(-130, 130)) * 0.38 - lastPlatformX * 0.38,
+      spawnMinX(),
+      spawnMaxX(w)
+    );
+    if (mainPlatformCount < 6){
+      const earlyShift = mainPlatformCount % 2 === 0 ? -1 : 1;
+      x = clamp(center + earlyShift * rand(55, 150) - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+    }
+
+    let candidate = makePlatform(x, y, w, 16);
+    for (let tries = 0; tries < 12 && overlapsAnyPlatform(candidate, 8); tries++){
+      x = clamp(rand(spawnMinX() + 2, spawnMaxX(w) - 2), spawnMinX() + 2, spawnMaxX(w) - 2);
+      candidate.x = x;
     }
 
     lastPlatformX = x;
+    lastMainSide = (x + w * 0.5) < center ? -1 : 1;
     mainPlatformCount += 1;
-    return { x, y, w, h: 16 };
+    return candidate;
   }
 
   function generatePlatformsUpTo(minY){
     while (nextPlatformY > minY){
       const climbNow = Math.max(0, SPAWN_Y - nextPlatformY);
       const difficulty = clamp(climbNow / 4200, 0, 1);
-      const gap = rand(lerp(70, 96, difficulty), lerp(108, 170, difficulty));
+      // 초반은 발판을 촘촘하게 배치해 난이도를 낮춘다.
+      const earlyDense = clamp((8 - mainPlatformCount) / 8, 0, 1);
+      const minGap = lerp(88, 122, difficulty) - earlyDense * 36;
+      const maxGap = lerp(142, 220, difficulty) - earlyDense * 58;
+      const gap = rand(Math.max(52, minGap), Math.max(78, maxGap));
       nextPlatformY -= gap;
 
       const main = spawnMainPlatform(nextPlatformY);
+      if (!main.keep && mainPlatformCount > 7){
+        const crumbleChance = lerp(0.11, 0.23, difficulty);
+        if (Math.random() < crumbleChance) main.crumble = true;
+      }
+      maybeAssignItem(main, difficulty);
       platforms.push(main);
 
-      const subChance = lerp(0.42, 0.16, difficulty);
+      // 초반은 보조 발판도 조금 더 자주 생성
+      const subChance = clamp(lerp(0.30, 0.08, difficulty) + earlyDense * 0.24, 0.08, 0.62);
       if (Math.random() < subChance){
         const w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
         const y = nextPlatformY + rand(-18, 18);
-        let x = rand(WORLD_MIN_X, WORLD_MAX_X - w);
+        let x = rand(spawnMinX() + 2, spawnMaxX(w) - 2);
         const mainCenter = main.x + main.w * 0.5;
         const subCenter = x + w * 0.5;
         if (Math.abs(subCenter - mainCenter) < 200){
           x = subCenter < mainCenter
-            ? clamp(main.x - rand(240, 340), WORLD_MIN_X, WORLD_MAX_X - w)
-            : clamp(main.x + rand(240, 340), WORLD_MIN_X, WORLD_MAX_X - w);
+            ? clamp(main.x - rand(240, 340), spawnMinX() + 2, spawnMaxX(w) - 2)
+            : clamp(main.x + rand(240, 340), spawnMinX() + 2, spawnMaxX(w) - 2);
         }
-        platforms.push({ x, y, w, h: 14 });
+        const sub = makePlatform(x, y, w, 14, { crumble: Math.random() < 0.34 && mainPlatformCount > 7 });
+        let placeable = !overlapsAnyPlatform(sub, 8);
+        for (let tries = 0; tries < 10 && !placeable; tries++){
+          sub.x = rand(spawnMinX() + 2, spawnMaxX(sub.w) - 2);
+          placeable = !overlapsAnyPlatform(sub, 8);
+        }
+        if (placeable){
+          maybeAssignItem(sub, difficulty);
+          platforms.push(sub);
+        }
       }
     }
   }
@@ -237,8 +300,179 @@
     for (let i = platforms.length - 1; i >= 0; i--){
       const pl = platforms[i];
       if (pl.keep) continue;
+      if (pl.broken){
+        platforms.splice(i, 1);
+        continue;
+      }
       if (pl.y > cutoffY) platforms.splice(i, 1);
     }
+  }
+
+  function updateCrumblePlatforms(dt){
+    const gp = player.onGround ? player.groundPlatform : null;
+    for (const pl of platforms){
+      if (!pl.crumble || pl.broken) continue;
+      if (pl === gp){
+        pl.standTime += dt;
+        if (pl.standTime >= 3){
+          shatterPlatform(pl);
+          player.onGround = false;
+          player.groundPlatform = null;
+        }
+      } else {
+        pl.standTime = Math.max(0, pl.standTime - dt * 1.7);
+      }
+    }
+  }
+
+  function isAppleBuffActive(now = performance.now()){
+    return now < appleBuffUntil;
+  }
+
+  function isBlueWeakActive(now = performance.now()){
+    return now < blueWeakUntil;
+  }
+
+  function maybeAssignItem(pl, difficulty){
+    if (pl.keep || pl.broken) return;
+    // 초반 5~6개 메인 발판 구간에서는 아이템 비활성화
+    if (mainPlatformCount <= 6) return;
+    const chance = lerp(0.38, 0.28, difficulty);
+    if (Math.random() > chance) return;
+    const type = Math.random() < 0.5 ? 'apple' : 'blueberry';
+    pl.item = { type, phase: rand(0, Math.PI * 2) };
+  }
+
+  function spawnPickupFx(x, y, color){
+    pickupPulseUntil = performance.now() + 260;
+    for (let i = 0; i < 10; i++){
+      const a = rand(0, Math.PI * 2);
+      const s = rand(85, 190);
+      debrisParticles.push({
+        x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 40,
+        life: 0.32, maxLife: 0.32, size: rand(2, 4),
+        color, grav: 380
+      });
+    }
+  }
+
+  function shatterPlatform(pl){
+    if (pl.broken || pl.keep) return;
+    pl.broken = true;
+    breakCrackFx.push({ x: pl.x, y: pl.y, w: pl.w, h: pl.h, life: 0.16, maxLife: 0.16 });
+
+    const pieces = Math.max(8, Math.floor(pl.w / 16));
+    for (let i = 0; i < pieces; i++){
+      const px = pl.x + rand(0, pl.w);
+      const py = pl.y + rand(1, pl.h - 1);
+      const ang = rand(-Math.PI, 0);
+      const spd = rand(120, 340);
+      debrisParticles.push({
+        x: px, y: py,
+        vx: Math.cos(ang) * spd + rand(-60, 60),
+        vy: Math.sin(ang) * spd - rand(30, 120),
+        life: rand(0.42, 0.7), maxLife: 0.7,
+        size: rand(2, 6),
+        color: pl.crumble ? '#8f6b6e' : '#5169cf',
+        grav: 720
+      });
+    }
+  }
+
+  function updateEffects(dt){
+    for (let i = debrisParticles.length - 1; i >= 0; i--){
+      const p = debrisParticles[i];
+      p.vy += (p.grav || 600) * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) debrisParticles.splice(i, 1);
+    }
+    for (let i = breakCrackFx.length - 1; i >= 0; i--){
+      breakCrackFx[i].life -= dt;
+      if (breakCrackFx[i].life <= 0) breakCrackFx.splice(i, 1);
+    }
+  }
+
+  function updateItemCollection(now){
+    const pcx = player.x + player.w * 0.5;
+    const pcy = player.y + player.h * 0.5;
+    for (const pl of platforms){
+      if (pl.broken || !pl.item) continue;
+      const itemX = pl.x + pl.w * 0.5;
+      const itemY = pl.y - 11 + Math.sin(now * ITEM_BOB_SPEED + pl.item.phase) * ITEM_BOB_AMP;
+      const d = Math.hypot(itemX - pcx, itemY - pcy);
+      if (d > 24) continue;
+
+      if (pl.item.type === 'apple'){
+        appleBuffUntil = Math.max(appleBuffUntil, now + APPLE_BUFF_MS);
+        spawnPickupFx(itemX, itemY, '#ff6b6b');
+      } else {
+        blueWeakUntil = Math.max(blueWeakUntil, now + BLUE_WEAK_MS);
+        spawnPickupFx(itemX, itemY, '#ffd84d');
+      }
+      pl.item = null;
+    }
+  }
+
+  function getPlayerTint(now){
+    const appleRem = appleBuffUntil - now;
+    const yellowRem = blueWeakUntil - now;
+    const rem = Math.max(appleRem, yellowRem);
+    if (rem <= 0) return null;
+
+    const color = appleRem >= yellowRem ? '#ff5a66' : '#ffd84d';
+    let alpha = 0.36;
+    if (rem <= 3000){
+      const blinkOn = Math.sin(now * 0.032) > 0;
+      alpha = blinkOn ? 0.34 : 0.06;
+    }
+    return { color, alpha };
+  }
+
+  function drawItemVisual(item, sx, sy){
+    if (item.type === 'apple'){
+      ctx.fillStyle = '#e84d5b';
+      ctx.fillRect(sx - 5, sy - 5, 10, 10);
+      ctx.fillStyle = '#ff7b86';
+      ctx.fillRect(sx - 2, sy - 4, 3, 3);
+      ctx.fillStyle = '#603820';
+      ctx.fillRect(sx - 1, sy - 8, 2, 3);
+      ctx.fillStyle = '#58b46a';
+      ctx.fillRect(sx + 1, sy - 9, 3, 2);
+    } else {
+      ctx.fillStyle = '#f4cd38';
+      ctx.fillRect(sx - 4, sy - 4, 8, 8);
+      ctx.fillRect(sx - 6, sy - 2, 3, 3);
+      ctx.fillRect(sx + 3, sy - 2, 3, 3);
+      ctx.fillStyle = '#ffe88f';
+      ctx.fillRect(sx - 1, sy - 2, 2, 2);
+    }
+  }
+
+  function drawDebrisAndCracks(){
+    for (const fx of breakCrackFx){
+      const a = clamp(fx.life / fx.maxLife, 0, 1);
+      const sy = fx.y - cam.y;
+      ctx.strokeStyle = `rgba(220, 170, 170, ${0.65 * a})`;
+      ctx.lineWidth = 1;
+      const c1 = fx.x + fx.w * 0.2;
+      const c2 = fx.x + fx.w * 0.46;
+      const c3 = fx.x + fx.w * 0.72;
+      ctx.beginPath();
+      ctx.moveTo(c1, sy + 2); ctx.lineTo(c1 + 8, sy + fx.h - 2);
+      ctx.moveTo(c2, sy + 1); ctx.lineTo(c2 - 6, sy + fx.h * 0.6); ctx.lineTo(c2 + 6, sy + fx.h - 2);
+      ctx.moveTo(c3, sy + 2); ctx.lineTo(c3 - 7, sy + fx.h - 2);
+      ctx.stroke();
+    }
+
+    for (const p of debrisParticles){
+      const a = clamp(p.life / (p.maxLife || 1), 0, 1);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color || '#9fb2ff';
+      ctx.fillRect(p.x, p.y - cam.y, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
   }
 
   // ===== Score & Time =====
@@ -400,7 +634,7 @@
     img.src = FIXED_SPRITE_SRC;
   }
 
-  function drawPixelSprite(kind, x, y, facing = 1){
+  function drawPixelSprite(kind, x, y, facing = 1, tint = null){
     if (fixedSpriteImg){
       const trim = fixedSpriteTrim || {
         sx: 0,
@@ -414,16 +648,36 @@
       const ox = x + (player.w - dw) * 0.5;
       const oy = y + (player.h - dh);
       const stretch = getJumpLegStretch(performance.now());
+      const tw = Math.max(1, Math.round(dw));
+      const th = Math.max(1, Math.round(dh));
+
+      if (spriteFxCanvas.width !== tw || spriteFxCanvas.height !== th){
+        spriteFxCanvas.width = tw;
+        spriteFxCanvas.height = th;
+      }
+      spriteFxCtx.clearRect(0, 0, tw, th);
+      spriteFxCtx.imageSmoothingEnabled = false;
+      if (facing < 0){
+        spriteFxCtx.save();
+        spriteFxCtx.translate(tw, 0);
+        spriteFxCtx.scale(-1, 1);
+        spriteFxCtx.drawImage(fixedSpriteImg, trim.sx, trim.sy, trim.sw, trim.sh, 0, 0, tw, th);
+        spriteFxCtx.restore();
+      } else {
+        spriteFxCtx.drawImage(fixedSpriteImg, trim.sx, trim.sy, trim.sw, trim.sh, 0, 0, tw, th);
+      }
+      if (tint){
+        spriteFxCtx.globalCompositeOperation = 'source-atop';
+        spriteFxCtx.globalAlpha = tint.alpha;
+        spriteFxCtx.fillStyle = tint.color;
+        spriteFxCtx.fillRect(0, 0, tw, th);
+        spriteFxCtx.globalCompositeOperation = 'source-over';
+        spriteFxCtx.globalAlpha = 1;
+      }
 
       ctx.save();
       ctx.imageSmoothingEnabled = false;
-      if (facing < 0){
-        ctx.translate(ox + dw, oy);
-        ctx.scale(-1, 1);
-        ctx.drawImage(fixedSpriteImg, trim.sx, trim.sy, trim.sw, trim.sh, 0, 0, dw, dh);
-      } else {
-        ctx.drawImage(fixedSpriteImg, trim.sx, trim.sy, trim.sw, trim.sh, ox, oy, dw, dh);
-      }
+      ctx.drawImage(spriteFxCanvas, ox, oy, dw, dh);
 
       if (stretch > 0.01){
         const legW = Math.max(2, Math.floor(dw * 0.09));
@@ -537,13 +791,15 @@
     if (pullLen < MIN_PULL_TO_JUMP) return;
 
     const power = clamp(pullLen / MAX_PULL, 0, 1);
-    const vy = -power * MAX_JUMP_VY;
-    const vx = (input.pullX / MAX_PULL) * MAX_JUMP_VX * power;
+    const now = performance.now();
+    const jumpScale = isBlueWeakActive(now) ? BLUE_JUMP_SCALE : 1;
+    const vy = -power * MAX_JUMP_VY * jumpScale;
+    const vx = (input.pullX / MAX_PULL) * MAX_JUMP_VX * power * jumpScale;
 
     player.vx = vx;
     player.vy = vy;
     player.onGround = false;
-    jumpStretchUntil = performance.now() + JUMP_LEG_STRETCH_MS;
+    jumpStretchUntil = now + JUMP_LEG_STRETCH_MS;
     if (Math.abs(vx) > 8) playerFacing = Math.sign(vx);
 
     const n = Math.hypot(vx, vy) || 1;
@@ -590,14 +846,33 @@
 
   function resolve(dt){
     player.onGround = false;
+    player.groundPlatform = null;
     const prevY = player.y;
 
     // X move
     player.x += player.vx * dt;
     if (Math.abs(player.vx) > 18) playerFacing = Math.sign(player.vx);
     for (const pl of platforms){
+      if (pl.broken) continue;
       if (!aabb(player.x, player.y, player.w, player.h, pl.x, pl.y, pl.w, pl.h)) continue;
+
       const impactX = Math.abs(player.vx);
+      if (isAppleBuffActive() && !pl.keep && impactX > APPLE_BREAK_IMPACT){
+        shatterPlatform(pl);
+        continue;
+      }
+
+      // 코너 스침(세로 겹침이 매우 얕은 경우)은 옆벽 충돌로 처리하지 않는다.
+      // 이걸 허용하면 "보이지 않는 벽"처럼 옆으로 밀려 착지를 놓치는 현상이 줄어든다.
+      const pTop = player.y;
+      const pBottom = player.y + player.h;
+      const overlapY = Math.min(pBottom, pl.y + pl.h) - Math.max(pTop, pl.y);
+      if (overlapY <= 6) continue;
+
+      // 발판 윗면 착지 직전 상황은 X보다 Y 처리(착지)를 우선한다.
+      const nextBottom = (player.y + player.vy * dt) + player.h;
+      if (player.vy >= 0 && pBottom <= pl.y + 8 && nextBottom >= pl.y - 2) continue;
+
       if (player.vx > 0) player.x = pl.x - player.w;
       else if (player.vx < 0) player.x = pl.x + pl.w;
       if (!applyCollisionMomentum('x', impactX)) player.vx = 0;
@@ -606,6 +881,7 @@
     // Y move
     player.y += player.vy * dt;
     for (const pl of platforms){
+      if (pl.broken) continue;
       const overlapsX = player.x < pl.x + pl.w && player.x + player.w > pl.x;
       if (!overlapsX) continue;
 
@@ -619,15 +895,20 @@
           player.y = pl.y - player.h;
           player.vy = 0;
           player.onGround = true;
-          continue;
+          player.groundPlatform = pl;
+          break;
         }
       } else if (player.vy < 0){
         const plBottom = pl.y + pl.h;
         if (prevTop >= plBottom && curTop <= plBottom){
           const impactY = Math.abs(player.vy);
+          if (isAppleBuffActive() && !pl.keep && impactY > APPLE_BREAK_IMPACT){
+            shatterPlatform(pl);
+            continue;
+          }
           player.y = plBottom;
           if (!applyCollisionMomentum('y', impactY)) player.vy = 0;
-          continue;
+          break;
         }
       }
 
@@ -636,10 +917,17 @@
         player.y = pl.y - player.h;
         player.vy = 0;
         player.onGround = true;
+        player.groundPlatform = pl;
+        break;
       } else {
         const impactY = Math.abs(player.vy);
+        if (isAppleBuffActive() && !pl.keep && impactY > APPLE_BREAK_IMPACT){
+          shatterPlatform(pl);
+          continue;
+        }
         player.y = pl.y + pl.h;
         if (!applyCollisionMomentum('y', impactY)) player.vy = 0;
+        break;
       }
     }
 
@@ -718,6 +1006,11 @@
     residualMomentum.dirX = 0;
     residualMomentum.dirY = -1;
     residualMomentum.strength = 0;
+    appleBuffUntil = 0;
+    blueWeakUntil = 0;
+    pickupPulseUntil = 0;
+    debrisParticles.length = 0;
+    breakCrackFx.length = 0;
     jumpStretchUntil = 0;
     playerFacing = 1;
     rankSubmittedThisRound = false;
@@ -740,6 +1033,9 @@
       player.vy *= AIR_DAMP;
 
       resolve(dt);
+      updateCrumblePlatforms(dt);
+      updateItemCollection(now);
+      updateEffects(dt);
 
       if (player.y < bestY) bestY = player.y;
 
@@ -760,6 +1056,7 @@
   function render(){
     const W = canvas.clientWidth;
     const H = canvas.clientHeight;
+    const now = performance.now();
 
     ctx.fillStyle = '#0b0f19';
     ctx.fillRect(0,0,W,H);
@@ -779,22 +1076,59 @@
     if (WORLD_MAX_X < W) ctx.fillRect(WORLD_MAX_X, 0, W - WORLD_MAX_X, H);
 
     for (const pl of platforms){
+      if (pl.broken) continue;
       const sy = pl.y - cam.y;
       if (sy > H + 80 || sy + pl.h < -80) continue;
 
-      ctx.fillStyle = '#1a2550';
+      const crumbleT = pl.crumble ? clamp(pl.standTime / 3, 0, 1) : 0;
+      ctx.fillStyle = pl.crumble
+        ? (crumbleT > 0.7 ? '#4f2a2f' : '#3a324b')
+        : '#1a2550';
       ctx.fillRect(pl.x, sy, pl.w, pl.h);
 
-      ctx.strokeStyle = '#2f46a8';
+      ctx.strokeStyle = pl.crumble ? '#8f6b6e' : '#2f46a8';
       ctx.lineWidth = 1;
       ctx.strokeRect(pl.x + 0.5, sy + 0.5, pl.w - 1, pl.h - 1);
+
+      if (pl.crumble){
+        // 금 간 블록 표현
+        ctx.strokeStyle = crumbleT > 0.7 ? '#d48888' : '#b39aa4';
+        ctx.lineWidth = 1;
+        const c1 = pl.x + pl.w * 0.22;
+        const c2 = pl.x + pl.w * 0.47;
+        const c3 = pl.x + pl.w * 0.71;
+        ctx.beginPath();
+        ctx.moveTo(c1, sy + 2); ctx.lineTo(c1 + 8, sy + pl.h - 2);
+        ctx.moveTo(c2, sy + 1); ctx.lineTo(c2 - 6, sy + pl.h * 0.6); ctx.lineTo(c2 + 6, sy + pl.h - 2);
+        ctx.moveTo(c3, sy + 2); ctx.lineTo(c3 - 7, sy + pl.h - 2);
+        ctx.stroke();
+      }
+
+      if (pl.item){
+        const itemX = pl.x + pl.w * 0.5;
+        const itemY = sy - 11 + Math.sin(now * ITEM_BOB_SPEED + pl.item.phase) * ITEM_BOB_AMP;
+        drawItemVisual(pl.item, itemX, itemY);
+      }
     }
+
+    drawDebrisAndCracks();
 
     const idleBob = isIdleAnimating()
       ? Math.sin(performance.now() * IDLE_BOB_SPEED) * IDLE_BOB_AMPLITUDE
       : 0;
-    const py = player.y - cam.y + idleBob;
-    drawPixelSprite(PLAYER_SPRITE_KIND, player.x, py, playerFacing);
+    const pickupPulse = clamp((pickupPulseUntil - now) / 260, 0, 1);
+    const py = player.y - cam.y + idleBob - pickupPulse * 1.2;
+    if (pickupPulse > 0){
+      const cx = player.x + player.w * 0.5;
+      const cy = py + player.h * 0.45;
+      ctx.strokeStyle = `rgba(255, 245, 168, ${0.35 * pickupPulse})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 16 + (1 - pickupPulse) * 8, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    const playerTint = getPlayerTint(now);
+    drawPixelSprite(PLAYER_SPRITE_KIND, player.x, py, playerFacing, playerTint);
 
     if (input.aiming){
       const sx = input.startX;
