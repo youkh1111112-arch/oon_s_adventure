@@ -5,9 +5,14 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
   <title>JumpKing-like Prototype (Charge Jump)</title>
   <style>
-    html, body { margin:0; padding:0; height:100%; background:#0b0f19; overflow:hidden; }
-    #wrap { position:relative; width:100%; height:100%; }
-    canvas { display:block; width:100%; height:100%; touch-action:none; }
+    html, body { margin:0; padding:0; width:100%; height:100%; background:#0b0f19; overflow:hidden; }
+    #wrap { position:fixed; inset:0; overflow:hidden; background:#0b0f19; }
+    canvas {
+      position:fixed; left:0; top:0; display:block;
+      width:100vw; height:100vh;
+      background:#0b0f19;
+      touch-action:none;
+    }
     .hud{
       position:absolute; left:12px; top:10px; color:#dbe3ff;
       font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -22,10 +27,10 @@
     .overlay{
       position:absolute; inset:0; display:grid; place-items:center;
       background:rgba(6,10,20,.62);
-      opacity:0; pointer-events:none;
-      transition:opacity .15s ease;
+      opacity:1; pointer-events:auto;
+      display:none;
     }
-    .overlay.show{ opacity:1; pointer-events:auto; }
+    .overlay.show{ display:grid; }
     .panel{
       text-align:center; color:#f4f7ff;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -39,6 +44,20 @@
       padding:11px 18px; border-radius:10px; cursor:pointer;
     }
     .restart-btn:hover{ background:#24397e; }
+    @media (max-width: 768px){
+      #leaderboard{
+        top:10px !important;
+        right:10px !important;
+        width:170px !important;
+        padding:8px !important;
+        border-radius:10px !important;
+        font-size:12px !important;
+      }
+      #leaderboardList{
+        padding-left:14px !important;
+        font-size:12px !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -54,7 +73,7 @@
   </div>
 </div>
 <div id="leaderboard" style="position:fixed; top:16px; right:16px; width:240px; padding:12px; background:rgba(0,0,0,.6); color:#fff; font-family:system-ui; border-radius:12px;">
-  <div style="font-weight:700; margin-bottom:8px;">TOP 10</div>
+  <div style="font-weight:700; margin-bottom:8px;">TOP 5</div>
   <ol id="leaderboardList" style="margin:0; padding-left:18px;"></ol>
 </div>
 
@@ -68,10 +87,14 @@
   const restartBtn = document.getElementById('restartBtn');
 
   function DPR(){ return Math.max(1, Math.min(2, window.devicePixelRatio || 1)); }
+  let viewportW = 0;
+  let viewportH = 0;
   function resize(){
     const dpr = DPR();
-    canvas.width = Math.floor(canvas.clientWidth * dpr);
-    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    viewportW = Math.round(window.innerWidth);
+    viewportH = Math.round(window.innerHeight);
+    canvas.width = Math.round(viewportW * dpr);
+    canvas.height = Math.round(viewportH * dpr);
     ctx.setTransform(dpr,0,0,dpr,0,0);
   }
   window.addEventListener('resize', resize, { passive:true });
@@ -107,12 +130,17 @@
   const PLAYFIELD_SIDE_MARGIN = 24;
   const START_PLATFORM_W = 180;
   const GROUND_PAD = 260;
+  const PLATFORM_SPAWN_SIDE_BLEED = 36;
   const ITEM_BOB_AMP = 2.6;
   const ITEM_BOB_SPEED = 0.0048;
   const APPLE_BUFF_MS = 10000;
   const BLUE_WEAK_MS = 10000;
   const BLUE_JUMP_SCALE = 1.45;
   const APPLE_BREAK_IMPACT = 170;
+  const REACH_MAX_DY = 205;
+  const CRUMBLE_BREAK_SEC = 1.7;
+  const AUTO_DECAY_START_SEC = 2.2;
+  const AUTO_DECAY_BREAK_SEC = 5.2;
 
   // ===== World =====
   const player = {
@@ -131,6 +159,8 @@
   let appleBuffUntil = 0;
   let blueWeakUntil = 0;
   let pickupPulseUntil = 0;
+  let pickupText = '';
+  let pickupTextUntil = 0;
   const debrisParticles = [];
   const breakCrackFx = [];
   const spriteFxCanvas = document.createElement('canvas');
@@ -156,27 +186,37 @@
   let lastPlatformX = 120;
   let mainPlatformCount = 0;
   let lastMainSide = 0;
+  let lastMainPlatform = null;
+  let earlyPreferredSide = 1;
+  const MAIN_MIN_DY = 90;
+  const MAIN_MAX_DY = 160;
+  const MAIN_MIN_SHIFT = 64;
+  const MAIN_ROUTE_RETRY = 28;
+  const MAIN_ROUTE_DEBUG = false;
+  const mainRouteRecent = [];
 
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
   function rand(min, max){ return min + Math.random() * (max - min); }
   function lerp(a,b,t){ return a + (b - a) * t; }
   function worldCenterX(){ return (WORLD_MIN_X + WORLD_MAX_X) * 0.5; }
-
   function updateWorldBounds(){
-    const W = canvas.clientWidth;
-    const playW = Math.min(PLAYFIELD_TARGET_W, Math.max(PLAYFIELD_MIN_W, W - PLAYFIELD_SIDE_MARGIN * 2));
-    WORLD_MIN_X = (W - playW) * 0.5;
-    WORLD_MAX_X = WORLD_MIN_X + playW;
+    const W = viewportW || Math.round(window.innerWidth);
+    // 중앙 고정 플레이필드를 없애고 화면 전체를 플레이 영역으로 사용
+    // (가운데 띠처럼 보이는 구분감을 제거)
+    WORLD_MIN_X = 0;
+    WORLD_MAX_X = W;
   }
 
   function seedBasePlatforms(){
     const playW = WORLD_MAX_X - WORLD_MIN_X;
     const startW = START_PLATFORM_W;
     const startX = clamp(worldCenterX() - startW * 0.5, WORLD_MIN_X + 24, WORLD_MAX_X - startW - 24);
+    const baseW = clamp(playW * 0.62, 320, 560);
+    const baseX = worldCenterX() - baseW * 0.5;
 
     platforms.length = 0;
     platforms.push(
-      { x: WORLD_MIN_X - GROUND_PAD, y: 640, w: playW + GROUND_PAD * 2, h: 50, keep: true, crumble: false, standTime: 0, broken: false },
+      { x: baseX, y: 640, w: baseW, h: 50, keep: true, crumble: false, standTime: 0, broken: false },
       { x: startX, y: 560, w: startW, h: 16, keep: true, crumble: false, standTime: 0, broken: false }
     );
 
@@ -184,12 +224,16 @@
     lastPlatformX = startX;
     mainPlatformCount = 0;
     lastMainSide = 0;
+    lastMainPlatform = makePlatform(startX, 560, startW, 16, { keep: true });
+    earlyPreferredSide = Math.random() < 0.5 ? -1 : 1;
     player.x = startX + (startW - player.w) * 0.5;
     player.y = SPAWN_Y;
   }
 
-  function spawnMinX(){ return WORLD_MIN_X - GROUND_PAD + 14; }
-  function spawnMaxX(width){ return WORLD_MAX_X + GROUND_PAD - width - 14; }
+  // 발판 생성 범위를 화면 근처로 제한해서
+  // 고도 상승 시 "화면은 비었는데 바깥쪽에만 발판 생성"되는 현상을 줄인다.
+  function spawnMinX(){ return WORLD_MIN_X - PLATFORM_SPAWN_SIDE_BLEED; }
+  function spawnMaxX(width){ return WORLD_MAX_X - width + PLATFORM_SPAWN_SIDE_BLEED; }
 
   function makePlatform(x, y, w, h, opts = {}){
     return {
@@ -197,9 +241,44 @@
       keep: !!opts.keep,
       crumble: !!opts.crumble,
       standTime: 0,
+      decayTime: 0,
       broken: false,
       item: null
     };
+  }
+
+  function horizontalGapBetween(from, to){
+    if (to.x > from.x + from.w) return to.x - (from.x + from.w);
+    if (from.x > to.x + to.w) return from.x - (to.x + to.w);
+    return 0;
+  }
+
+  function getReachMaxDx(upwardDy, difficulty){
+    const t = clamp((upwardDy - 32) / (REACH_MAX_DY - 32), 0, 1);
+    return lerp(330, 108, t) * lerp(1.06, 0.90, difficulty);
+  }
+
+  function getPreferredMinDx(upwardDy, difficulty){
+    const base = clamp(upwardDy * 0.56, 54, 128);
+    return base * lerp(1.00, 0.86, difficulty);
+  }
+
+  function isReachableFrom(from, to, difficulty){
+    const upwardDy = from.y - to.y;
+    if (upwardDy < 24 || upwardDy > REACH_MAX_DY) return false;
+    const gapX = horizontalGapBetween(from, to);
+    return gapX <= getReachMaxDx(upwardDy, difficulty);
+  }
+
+  function hasReachableAnchor(candidate, difficulty){
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (pl.y <= candidate.y) continue;
+      const upwardDy = pl.y - candidate.y;
+      if (upwardDy > REACH_MAX_DY + 16) continue;
+      if (isReachableFrom(pl, candidate, difficulty)) return true;
+    }
+    return false;
   }
 
   function overlapsAnyPlatform(candidate, padding = 6){
@@ -216,51 +295,155 @@
   }
 
   function spawnMainPlatform(y){
+    const anchor = lastMainPlatform;
     const center = worldCenterX();
     const climb = Math.max(0, SPAWN_Y - y);
     const difficulty = clamp(climb / 4200, 0, 1);
 
     let w;
     const bucket = Math.random();
-    if (bucket < 0.24) w = rand(lerp(180, 130, difficulty), lerp(250, 190, difficulty)); // wide
-    else if (bucket < 0.74) w = rand(lerp(130, 92, difficulty), lerp(185, 140, difficulty)); // mid
-    else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty)); // narrow
+    if (bucket < 0.24) w = rand(lerp(180, 130, difficulty), lerp(250, 190, difficulty));
+    else if (bucket < 0.74) w = rand(lerp(130, 92, difficulty), lerp(185, 140, difficulty));
+    else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty));
 
-    const roam = lerp(120, 290, difficulty);
-    let x = clamp(
-      lastPlatformX + rand(-roam, roam) * 0.62 + (center + rand(-130, 130)) * 0.38 - lastPlatformX * 0.38,
-      spawnMinX(),
-      spawnMaxX(w)
-    );
-    if (mainPlatformCount < 6){
-      const earlyShift = mainPlatformCount % 2 === 0 ? -1 : 1;
-      x = clamp(center + earlyShift * rand(55, 150) - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+    // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
+    if (!anchor){
+      const x0 = clamp(center - w * 0.5 + rand(-80, 80), spawnMinX() + 2, spawnMaxX(w) - 2);
+      const fallback = makePlatform(x0, y, w, 16);
+      lastPlatformX = fallback.x;
+      lastMainSide = (fallback.x + w * 0.5) < center ? -1 : 1;
+      lastMainPlatform = makePlatform(fallback.x, fallback.y, fallback.w, fallback.h);
+      mainPlatformCount += 1;
+      return fallback;
     }
 
-    let candidate = makePlatform(x, y, w, 16);
-    for (let tries = 0; tries < 12 && overlapsAnyPlatform(candidate, 8); tries++){
-      x = clamp(rand(spawnMinX() + 2, spawnMaxX(w) - 2), spawnMinX() + 2, spawnMaxX(w) - 2);
-      candidate.x = x;
+    const upwardDy = clamp(anchor.y - y, MAIN_MIN_DY, MAIN_MAX_DY);
+    const anchorCx = anchor.x + anchor.w * 0.5;
+    const maxDxRaw = getReachMaxDx(upwardDy, difficulty);
+    const maxDx = Math.max(MAIN_MIN_SHIFT + 8, maxDxRaw - 8);
+    const minDxBase = getPreferredMinDx(upwardDy, difficulty);
+    const minDx = clamp(Math.max(MAIN_MIN_SHIFT, minDxBase), MAIN_MIN_SHIFT, Math.max(MAIN_MIN_SHIFT + 6, maxDx - 8));
+    const preferredSide = lastMainSide === 0 ? (Math.random() < 0.5 ? -1 : 1) : -lastMainSide;
+    const sides = [preferredSide, -preferredSide];
+
+    let candidate = null;
+    let chosenSide = preferredSide;
+
+    for (let tries = 0; tries < MAIN_ROUTE_RETRY; tries++){
+      const side = tries < Math.floor(MAIN_ROUTE_RETRY * 0.7) ? sides[0] : sides[1];
+      const dx = rand(minDx, maxDx);
+      const targetCx = anchorCx + side * dx + rand(-12, 12);
+      const nx = clamp(targetCx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+      const c = makePlatform(nx, y, w, 16);
+      const shift = Math.abs((c.x + c.w * 0.5) - anchorCx);
+      if (shift < MAIN_MIN_SHIFT) continue;
+      if (overlapsAnyPlatform(c, 8)) continue;
+      if (!isReachableFrom(anchor, c, difficulty)) continue;
+      candidate = c;
+      chosenSide = side;
+      break;
     }
 
-    lastPlatformX = x;
-    lastMainSide = (x + w * 0.5) < center ? -1 : 1;
+    // 실패 시 dy/dx를 줄여서라도 반드시 도달 가능한 메인 루트 확보
+    if (!candidate){
+      for (let relax = 0; relax < 12 && !candidate; relax++){
+        const softDy = clamp(upwardDy - relax * 6, 72, upwardDy);
+        const softMaxDx = Math.max(40, getReachMaxDx(softDy, difficulty) - 6);
+        const softMinDx = clamp(minDx * (0.92 - relax * 0.03), 36, softMaxDx - 4);
+        const py = anchor.y - softDy;
+        for (const side of sides){
+          const dx = clamp(rand(softMinDx, softMaxDx), 36, softMaxDx);
+          const nx = clamp(anchorCx + side * dx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+          const c = makePlatform(nx, py, w, 16);
+          const shift = Math.abs((c.x + c.w * 0.5) - anchorCx);
+          if (shift < 34) continue;
+          if (overlapsAnyPlatform(c, 8)) continue;
+          if (!isReachableFrom(anchor, c, difficulty)) continue;
+          candidate = c;
+          chosenSide = side;
+          break;
+        }
+      }
+    }
+
+    // 마지막 안전장치: 반드시 통과 가능한 위치를 한 번 더 보장
+    if (!candidate){
+      const side = preferredSide;
+      const safeDy = clamp(upwardDy, 76, 118);
+      const safeMaxDx = Math.max(44, getReachMaxDx(safeDy, difficulty) - 8);
+      const safeDx = clamp(Math.min(Math.max(MAIN_MIN_SHIFT, minDx), safeMaxDx - 4), 36, safeMaxDx);
+      const py = anchor.y - safeDy;
+      const nx = clamp(anchorCx + side * safeDx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+      candidate = makePlatform(nx, py, w, 16);
+      chosenSide = side;
+      // 혹시 충돌이면 반대편으로 스왑
+      if (overlapsAnyPlatform(candidate, 8) || !isReachableFrom(anchor, candidate, difficulty)){
+        const nx2 = clamp(anchorCx - side * safeDx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+        const c2 = makePlatform(nx2, py, w, 16);
+        if (!overlapsAnyPlatform(c2, 8) && isReachableFrom(anchor, c2, difficulty)){
+          candidate = c2;
+          chosenSide = -side;
+        }
+      }
+    }
+
+    if (!candidate || overlapsAnyPlatform(candidate, 8) || !isReachableFrom(anchor, candidate, difficulty)){
+      let forced = null;
+      for (let dyTry = 108; dyTry >= 64 && !forced; dyTry -= 6){
+        const py = anchor.y - dyTry;
+        const maxDxTry = Math.max(30, getReachMaxDx(dyTry, difficulty) - 4);
+        const minDxTry = Math.min(Math.max(24, MAIN_MIN_SHIFT - 24), maxDxTry - 2);
+        for (const side of sides){
+          for (let dxTry = maxDxTry; dxTry >= minDxTry; dxTry -= 6){
+            const nx = clamp(anchorCx + side * dxTry - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+            const c = makePlatform(nx, py, w, 16);
+            if (overlapsAnyPlatform(c, 8)) continue;
+            if (!isReachableFrom(anchor, c, difficulty)) continue;
+            forced = c;
+            chosenSide = side;
+            break;
+          }
+          if (forced) break;
+        }
+      }
+      if (forced) candidate = forced;
+    }
+
+    if (!candidate){
+      const py = anchor.y - 72;
+      const nx = clamp(anchorCx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+      candidate = makePlatform(nx, py, w, 16);
+      chosenSide = preferredSide;
+    }
+
+    const dxLog = Math.round(Math.abs((candidate.x + candidate.w * 0.5) - anchorCx));
+    const dyLog = Math.round(anchor.y - candidate.y);
+    mainRouteRecent.push({ dx: dxLog, dy: dyLog, side: chosenSide });
+    if (mainRouteRecent.length > 10) mainRouteRecent.shift();
+    if (MAIN_ROUTE_DEBUG){
+      console.log('[main-route]', mainRouteRecent.map((m) => `dx:${m.dx} dy:${m.dy} side:${m.side > 0 ? 'R' : 'L'}`).join(' | '));
+    }
+
+    lastPlatformX = candidate.x;
+    lastMainSide = chosenSide;
+    lastMainPlatform = makePlatform(candidate.x, candidate.y, candidate.w, candidate.h);
     mainPlatformCount += 1;
     return candidate;
   }
 
   function generatePlatformsUpTo(minY){
     while (nextPlatformY > minY){
-      const climbNow = Math.max(0, SPAWN_Y - nextPlatformY);
+      const anchorY = lastMainPlatform ? lastMainPlatform.y : nextPlatformY;
+      const climbNow = Math.max(0, SPAWN_Y - anchorY);
       const difficulty = clamp(climbNow / 4200, 0, 1);
-      // 초반은 발판을 촘촘하게 배치해 난이도를 낮춘다.
-      const earlyDense = clamp((8 - mainPlatformCount) / 8, 0, 1);
-      const minGap = lerp(88, 122, difficulty) - earlyDense * 36;
-      const maxGap = lerp(142, 220, difficulty) - earlyDense * 58;
-      const gap = rand(Math.max(52, minGap), Math.max(78, maxGap));
-      nextPlatformY -= gap;
+      const earlyDense = clamp((10 - mainPlatformCount) / 10, 0, 1);
+      const mainMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
+      const mainMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), mainMinDy + 16, MAIN_MAX_DY);
+      const dy = rand(mainMinDy, mainMaxDy);
+      nextPlatformY = anchorY - dy;
 
       const main = spawnMainPlatform(nextPlatformY);
+      nextPlatformY = main.y;
       if (!main.keep && mainPlatformCount > 7){
         const crumbleChance = lerp(0.11, 0.23, difficulty);
         if (Math.random() < crumbleChance) main.crumble = true;
@@ -268,8 +451,8 @@
       maybeAssignItem(main, difficulty);
       platforms.push(main);
 
-      // 초반은 보조 발판도 조금 더 자주 생성
-      const subChance = clamp(lerp(0.30, 0.08, difficulty) + earlyDense * 0.24, 0.08, 0.62);
+      // 고도 상승 시에도 보조 발판 확률 하한을 높여 밀도 유지
+      const subChance = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
       if (Math.random() < subChance){
         const w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
         const y = nextPlatformY + rand(-18, 18);
@@ -314,13 +497,28 @@
       if (!pl.crumble || pl.broken) continue;
       if (pl === gp){
         pl.standTime += dt;
-        if (pl.standTime >= 3){
+        if (pl.standTime >= CRUMBLE_BREAK_SEC){
           shatterPlatform(pl);
           player.onGround = false;
           player.groundPlatform = null;
         }
       } else {
         pl.standTime = Math.max(0, pl.standTime - dt * 1.7);
+      }
+    }
+  }
+
+  function updateAutoDecayPlatforms(dt){
+    for (const pl of platforms){
+      if (pl.keep || pl.broken) continue;
+      const belowPlayer = pl.y > player.y + player.h + 36;
+      if (belowPlayer){
+        pl.decayTime = Math.min(AUTO_DECAY_BREAK_SEC + 1.2, pl.decayTime + dt * 1.25);
+        if (pl.decayTime >= AUTO_DECAY_BREAK_SEC){
+          shatterPlatform(pl);
+        }
+      } else {
+        pl.decayTime = Math.max(0, pl.decayTime - dt * 0.30);
       }
     }
   }
@@ -354,6 +552,11 @@
         color, grav: 380
       });
     }
+  }
+
+  function showPickupText(text){
+    pickupText = text;
+    pickupTextUntil = performance.now() + 1300;
   }
 
   function shatterPlatform(pl){
@@ -407,9 +610,11 @@
       if (pl.item.type === 'apple'){
         appleBuffUntil = Math.max(appleBuffUntil, now + APPLE_BUFF_MS);
         spawnPickupFx(itemX, itemY, '#ff6b6b');
+        showPickupText('운이의 힘이 굉장히 세졌습니다');
       } else {
         blueWeakUntil = Math.max(blueWeakUntil, now + BLUE_WEAK_MS);
         spawnPickupFx(itemX, itemY, '#ffd84d');
+        showPickupText('운이가 자신감 있게 점프합니다');
       }
       pl.item = null;
     }
@@ -958,7 +1163,7 @@
   }
 
   function checkGameOver(){
-    const H = canvas.clientHeight;
+    const H = viewportH || Math.round(window.innerHeight);
     const outBelow = (player.y - cam.y) > (H + BOTTOM_OUT_MARGIN);
     if (outBelow) setGameOver(true);
   }
@@ -994,7 +1199,7 @@
     player.onGround = false;
     cam.y = 0;
 
-    generatePlatformsUpTo(player.y - canvas.clientHeight * 2.2);
+    generatePlatformsUpTo(player.y - (viewportH || Math.round(window.innerHeight)) * 2.2);
 
     startY = player.y;
     bestY = player.y;
@@ -1009,6 +1214,8 @@
     appleBuffUntil = 0;
     blueWeakUntil = 0;
     pickupPulseUntil = 0;
+    pickupText = '';
+    pickupTextUntil = 0;
     debrisParticles.length = 0;
     breakCrackFx.length = 0;
     jumpStretchUntil = 0;
@@ -1034,12 +1241,13 @@
 
       resolve(dt);
       updateCrumblePlatforms(dt);
+      updateAutoDecayPlatforms(dt);
       updateItemCollection(now);
       updateEffects(dt);
 
       if (player.y < bestY) bestY = player.y;
 
-      const H = canvas.clientHeight;
+      const H = viewportH || Math.round(window.innerHeight);
       const target = player.y - H * 0.40;
       cam.y = Math.min(cam.y, target);
 
@@ -1054,45 +1262,34 @@
   }
 
   function render(){
-    const W = canvas.clientWidth;
-    const H = canvas.clientHeight;
+    const W = viewportW || Math.round(window.innerWidth);
+    const H = viewportH || Math.round(window.innerHeight);
     const now = performance.now();
 
     ctx.fillStyle = '#0b0f19';
     ctx.fillRect(0,0,W,H);
-
-    ctx.globalAlpha = 0.12;
-    ctx.fillStyle = '#2a3a6a';
-    for (let i=0;i<70;i++){
-      const x = (i*97) % W;
-      const y = (i*173) % H;
-      ctx.fillRect(x, y, 2, 2);
-    }
-    ctx.globalAlpha = 1;
-
-    // playfield boundaries
-    ctx.fillStyle = 'rgba(2, 6, 14, 0.45)';
-    if (WORLD_MIN_X > 0) ctx.fillRect(0, 0, WORLD_MIN_X, H);
-    if (WORLD_MAX_X < W) ctx.fillRect(WORLD_MAX_X, 0, W - WORLD_MAX_X, H);
 
     for (const pl of platforms){
       if (pl.broken) continue;
       const sy = pl.y - cam.y;
       if (sy > H + 80 || sy + pl.h < -80) continue;
 
-      const crumbleT = pl.crumble ? clamp(pl.standTime / 3, 0, 1) : 0;
-      ctx.fillStyle = pl.crumble
-        ? (crumbleT > 0.7 ? '#4f2a2f' : '#3a324b')
+      const crumbleT = pl.crumble ? clamp(pl.standTime / CRUMBLE_BREAK_SEC, 0, 1) : 0;
+      const autoDecayT = clamp((pl.decayTime - AUTO_DECAY_START_SEC) / (AUTO_DECAY_BREAK_SEC - AUTO_DECAY_START_SEC), 0, 1);
+      const crackT = Math.max(crumbleT, autoDecayT);
+      const cracked = pl.crumble || autoDecayT > 0;
+      ctx.fillStyle = cracked
+        ? (crackT > 0.7 ? '#4f2a2f' : '#3a324b')
         : '#1a2550';
       ctx.fillRect(pl.x, sy, pl.w, pl.h);
 
-      ctx.strokeStyle = pl.crumble ? '#8f6b6e' : '#2f46a8';
+      ctx.strokeStyle = cracked ? '#8f6b6e' : '#2f46a8';
       ctx.lineWidth = 1;
       ctx.strokeRect(pl.x + 0.5, sy + 0.5, pl.w - 1, pl.h - 1);
 
-      if (pl.crumble){
+      if (cracked){
         // 금 간 블록 표현
-        ctx.strokeStyle = crumbleT > 0.7 ? '#d48888' : '#b39aa4';
+        ctx.strokeStyle = crackT > 0.7 ? '#d48888' : '#b39aa4';
         ctx.lineWidth = 1;
         const c1 = pl.x + pl.w * 0.22;
         const c2 = pl.x + pl.w * 0.47;
@@ -1129,6 +1326,26 @@
     }
     const playerTint = getPlayerTint(now);
     drawPixelSprite(PLAYER_SPRITE_KIND, player.x, py, playerFacing, playerTint);
+
+    if (pickupText && now < pickupTextUntil){
+      const t = clamp((pickupTextUntil - now) / 1300, 0, 1);
+      const alpha = t < 0.28 ? (t / 0.28) : 1;
+      const tx = player.x + player.w * 0.5;
+      const ty = py - 14 - (1 - t) * 12;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = '700 15px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(8, 12, 22, 0.82)';
+      ctx.strokeText(pickupText, tx, ty);
+      ctx.fillStyle = '#ffe9a8';
+      ctx.fillText(pickupText, tx, ty);
+      ctx.restore();
+    } else if (pickupText && now >= pickupTextUntil){
+      pickupText = '';
+    }
 
     if (input.aiming){
       const sx = input.startX;
@@ -1169,7 +1386,7 @@ POS    (${player.x.toFixed(0)}, ${player.y.toFixed(0)})`;
   updateWorldBounds();
   seedBasePlatforms();
   loadFixedSprite();
-  generatePlatformsUpTo(player.y - canvas.clientHeight * 2.2);
+  generatePlatformsUpTo(player.y - (viewportH || Math.round(window.innerHeight)) * 2.2);
   requestAnimationFrame(tick);
 })();
 </script>
@@ -1194,7 +1411,7 @@ POS    (${player.x.toFixed(0)}, ${player.y.toFixed(0)})`;
       .select("name,score,created_at")
       .order("score", { ascending: false })
       .order("created_at", { ascending: true })
-      .limit(10);
+      .limit(5);
 
     if (error) {
       console.error("fetchTop10 error:", error);
