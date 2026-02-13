@@ -301,6 +301,7 @@
   const DESKTOP_MAIN_MAX_W_SCREEN_RATIO = 0.62;
   const MOBILE_SUB_MAX_W_SCREEN_RATIO = 0.52;
   const DESKTOP_SUB_MAX_W_SCREEN_RATIO = 0.58;
+  const RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.52;
   const BLOCKING_CEILING_DY = 120;
   const BLOCKING_CEILING_OVERLAP_RATIO = 0.58;
   const MOBILE_SUB_ROLLS_MAX = 1;
@@ -513,7 +514,7 @@
       }
       const screenCapRatio = isMobile ? MOBILE_MAIN_MAX_W_SCREEN_RATIO : DESKTOP_MAIN_MAX_W_SCREEN_RATIO;
       const hardCap = playW * lerp(screenCapRatio, screenCapRatio - 0.14, climbRatio);
-      w = Math.min(w, hardCap);
+      w = Math.min(w, hardCap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
     }
 
     // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
@@ -756,10 +757,10 @@
           const climbRatio = clamp(climbNow / 3600, 0, 1);
           if (isMobile){
             const cap = playW * lerp(MOBILE_SUB_MAX_W_SCREEN_RATIO, MOBILE_SUB_MAX_W_SCREEN_RATIO - 0.12, climbRatio);
-            w = Math.min(w, cap);
+            w = Math.min(w, cap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
           } else {
             const cap = playW * lerp(DESKTOP_SUB_MAX_W_SCREEN_RATIO, DESKTOP_SUB_MAX_W_SCREEN_RATIO - 0.10, climbRatio);
-            w = Math.min(w, cap);
+            w = Math.min(w, cap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
           }
         }
         const y = isMobile
