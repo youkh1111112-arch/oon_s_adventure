@@ -302,6 +302,10 @@
   const MOBILE_SUB_MAX_W_SCREEN_RATIO = 0.52;
   const DESKTOP_SUB_MAX_W_SCREEN_RATIO = 0.58;
   const RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.52;
+  const MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.50;
+  const SMALL_ANCHOR_W = 132;
+  const SMALL_ANCHOR_NEARBY_Y_BAND = 66;
+  const SMALL_ANCHOR_WIDE_BLOCK_RATIO = 0.44;
   const BLOCKING_CEILING_DY = 120;
   const BLOCKING_CEILING_OVERLAP_RATIO = 0.58;
   const MOBILE_SUB_ROLLS_MAX = 1;
@@ -310,6 +314,10 @@
   const MOBILE_ROUTE_BLOCK_DY_MIN = 26;
   const MOBILE_ROUTE_BLOCK_DY_MAX = 170;
   const MOBILE_ROUTE_BLOCK_OVERLAP_RATIO = 0.46;
+  const CEILING_TRAP_BLOCKED_RATIO = 0.85;
+  const CEILING_TRAP_MIN_FREE_W = 70;
+  const CEILING_TRAP_NEAR_ANCHOR = 120;
+  const CEILING_TRAP_REROLL_MAX = 30;
   const mainRouteRecent = [];
   const mainDyRecent = { mobile: [], desktop: [] };
 
@@ -433,12 +441,127 @@
     return count;
   }
 
+  function isSmallSingleAnchor(anchor){
+    if (!anchor) return false;
+    if (anchor.w > SMALL_ANCHOR_W) return false;
+    let nearby = 0;
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (Math.abs(pl.y - anchor.y) > SMALL_ANCHOR_NEARBY_Y_BAND) continue;
+      nearby += 1;
+    }
+    // If only the anchor level has one-ish footing, treat it as "small single platform".
+    return nearby <= 2;
+  }
+
   function isBlockingMainRoute(main, candidate){
     const upwardDy = main.y - candidate.y;
     if (upwardDy < MOBILE_ROUTE_BLOCK_DY_MIN || upwardDy > MOBILE_ROUTE_BLOCK_DY_MAX) return false;
     const overlapX = Math.max(0, Math.min(main.x + main.w, candidate.x + candidate.w) - Math.max(main.x, candidate.x));
     const overlapNeed = Math.min(main.w, candidate.w) * MOBILE_ROUTE_BLOCK_OVERLAP_RATIO;
     return overlapX >= overlapNeed;
+  }
+
+  function hasWidePlatformInYBand(y, band = 25, widthRatio = 0.42){
+    const playW = WORLD_MAX_X - WORLD_MIN_X;
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (Math.abs(pl.y - y) > band) continue;
+      if (pl.w >= playW * widthRatio) return true;
+    }
+    return false;
+  }
+
+  function mergeIntervals(intervals){
+    if (intervals.length === 0) return [];
+    intervals.sort((a, b) => a[0] - b[0]);
+    const merged = [intervals[0].slice()];
+    for (let i = 1; i < intervals.length; i++){
+      const cur = intervals[i];
+      const last = merged[merged.length - 1];
+      if (cur[0] <= last[1]){
+        last[1] = Math.max(last[1], cur[1]);
+      } else {
+        merged.push(cur.slice());
+      }
+    }
+    return merged;
+  }
+
+  function getCeilingTrapAnalysis(anchor, extraPlatforms = [], isMobile = false){
+    const rangeTop = anchor.y - (isMobile ? 300 : 260);
+    const rangeBottom = anchor.y - (isMobile ? 70 : 80);
+    const intervals = [];
+    const sources = platforms.concat(extraPlatforms);
+    for (const pl of sources){
+      if (!pl || pl.broken) continue;
+      const plTop = pl.y;
+      const plBottom = pl.y + pl.h;
+      if (plBottom < rangeTop || plTop > rangeBottom) continue;
+      const l = Math.max(WORLD_MIN_X, pl.x);
+      const r = Math.min(WORLD_MAX_X, pl.x + pl.w);
+      if (r <= l) continue;
+      intervals.push([l, r]);
+    }
+    const blocked = mergeIntervals(intervals);
+    const free = [];
+    let cursor = WORLD_MIN_X;
+    for (const [l, r] of blocked){
+      if (l > cursor) free.push([cursor, l]);
+      cursor = Math.max(cursor, r);
+    }
+    if (cursor < WORLD_MAX_X) free.push([cursor, WORLD_MAX_X]);
+
+    const playW = Math.max(1, WORLD_MAX_X - WORLD_MIN_X);
+    let blockedLen = 0;
+    for (const [l, r] of blocked) blockedLen += (r - l);
+    const blockedRatio = blockedLen / playW;
+    const anchorCx = anchor.x + anchor.w * 0.5;
+    const hasPassageNearAnchor = free.some(([l, r]) => {
+      if ((r - l) < CEILING_TRAP_MIN_FREE_W) return false;
+      if (anchorCx < l) return (l - anchorCx) <= CEILING_TRAP_NEAR_ANCHOR;
+      if (anchorCx > r) return (anchorCx - r) <= CEILING_TRAP_NEAR_ANCHOR;
+      return true;
+    });
+
+    return {
+      blockedRatio,
+      freeIntervals: free,
+      trap: blockedRatio > CEILING_TRAP_BLOCKED_RATIO && !hasPassageNearAnchor
+    };
+  }
+
+  function detectCeilingTrap(anchor, extraPlatforms = [], isMobile = false, withLog = true){
+    const analysis = getCeilingTrapAnalysis(anchor, extraPlatforms, isMobile);
+    if (analysis.trap && withLog){
+      const freeText = analysis.freeIntervals
+        .map(([l, r]) => `[${Math.round(l)},${Math.round(r)}]`)
+        .join(', ');
+      console.log(
+        `CEILING_TRAP: anchorY=${Math.round(anchor.y)}, blockedRatio=${analysis.blockedRatio.toFixed(2)}, freeIntervals=${freeText}`
+      );
+    }
+    return analysis;
+  }
+
+  function buildRescuePlatform(anchor, difficulty, isMobile){
+    const playW = WORLD_MAX_X - WORLD_MIN_X;
+    const w = clamp(playW * (isMobile ? 0.24 : 0.20), 78, 116);
+    const baseDy = isMobile ? rand(98, 138) : rand(88, 126);
+    const maxDx = Math.max(46, getReachMaxDx(baseDy, difficulty) * 0.88);
+    const minDx = Math.max(36, maxDx * 0.38);
+    const anchorCx = anchor.x + anchor.w * 0.5;
+    for (let i = 0; i < 24; i++){
+      const side = i % 2 === 0 ? -1 : 1;
+      const cx = anchorCx + side * rand(minDx, maxDx);
+      const x = clamp(cx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+      const y = anchor.y - baseDy;
+      const rescue = makePlatform(x, y, w, 14);
+      if (overlapsAnyPlatform(rescue, 8)) continue;
+      if (!isReachableFrom(anchor, rescue, difficulty)) continue;
+      return rescue;
+    }
+    return null;
   }
 
   function pathCenterXAtY(from, to, y){
@@ -506,6 +629,10 @@
     if (bucket < 0.24) w = rand(lerp(180, 130, difficulty), lerp(250, 190, difficulty));
     else if (bucket < 0.74) w = rand(lerp(130, 92, difficulty), lerp(185, 140, difficulty));
     else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty));
+    if (hasWidePlatformInYBand(y, 25, 0.42)){
+      const playW = WORLD_MAX_X - WORLD_MIN_X;
+      w = Math.min(w, playW * 0.38);
+    }
     {
       const playW = WORLD_MAX_X - WORLD_MIN_X;
       const climbRatio = clamp(climb / 3600, 0, 1);
@@ -514,7 +641,13 @@
       }
       const screenCapRatio = isMobile ? MOBILE_MAIN_MAX_W_SCREEN_RATIO : DESKTOP_MAIN_MAX_W_SCREEN_RATIO;
       const hardCap = playW * lerp(screenCapRatio, screenCapRatio - 0.14, climbRatio);
-      w = Math.min(w, hardCap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
+      const randomCap = isMobile
+        ? playW * MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO
+        : playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO;
+      w = Math.min(w, hardCap, randomCap);
+      if (isSmallSingleAnchor(anchor)){
+        w = Math.min(w, playW * SMALL_ANCHOR_WIDE_BLOCK_RATIO);
+      }
     }
 
     // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
@@ -691,7 +824,10 @@
       let main = null;
       let attempts = 0;
       const prevMainForRoute = lastMainPlatform ? { ...lastMainPlatform } : null;
-      for (let i = 0; i < (isMobile ? MOBILE_MAIN_REROLL_MAX : 1); i++){
+      const maxMainAttempts = isMobile
+        ? Math.max(MOBILE_MAIN_REROLL_MAX, CEILING_TRAP_REROLL_MAX)
+        : CEILING_TRAP_REROLL_MAX;
+      for (let i = 0; i < maxMainAttempts; i++){
         attempts = i + 1;
         const snapshot = snapshotMainGenState();
         const dy = rand(dyMin, dyMax);
@@ -714,6 +850,14 @@
           console.log('[main-mobile] reroll reason: dy too small');
           continue;
         }
+        if (prevMainForRoute){
+          const trap = detectCeilingTrap(prevMainForRoute, [candidate], isMobile, true);
+          if (trap.trap){
+            restoreMainGenState(snapshot);
+            console.log(`CEILING_TRAP reroll=${attempts}/${maxMainAttempts}`);
+            continue;
+          }
+        }
         main = candidate;
         break;
       }
@@ -731,6 +875,15 @@
       }
 
       nextPlatformY = main.y;
+      if (prevMainForRoute){
+        const postTrap = detectCeilingTrap(prevMainForRoute, [main], isMobile, true);
+        if (postTrap.trap){
+          const rescue = buildRescuePlatform(prevMainForRoute, difficulty, isMobile);
+          if (rescue){
+            platforms.push(rescue);
+          }
+        }
+      }
       if (isMobile){
         const actualDy = Math.round(anchorY - main.y);
         console.log(
@@ -751,21 +904,25 @@
       const subRolls = isMobile ? MOBILE_SUB_ROLLS_MAX : 1;
       for (let subIndex = 0; subIndex < subRolls; subIndex++){
         if (Math.random() >= subChance) continue;
+        const y = isMobile
+          ? (nextPlatformY + rand(6, 26))
+          : (nextPlatformY + rand(-18, 18));
         let w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
+        if (hasWidePlatformInYBand(y, 25, 0.42)){
+          const playW = WORLD_MAX_X - WORLD_MIN_X;
+          w = Math.min(w, playW * 0.38);
+        }
         {
           const playW = WORLD_MAX_X - WORLD_MIN_X;
           const climbRatio = clamp(climbNow / 3600, 0, 1);
           if (isMobile){
             const cap = playW * lerp(MOBILE_SUB_MAX_W_SCREEN_RATIO, MOBILE_SUB_MAX_W_SCREEN_RATIO - 0.12, climbRatio);
-            w = Math.min(w, cap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
+            w = Math.min(w, cap, playW * MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
           } else {
             const cap = playW * lerp(DESKTOP_SUB_MAX_W_SCREEN_RATIO, DESKTOP_SUB_MAX_W_SCREEN_RATIO - 0.10, climbRatio);
             w = Math.min(w, cap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
           }
         }
-        const y = isMobile
-          ? (nextPlatformY + rand(6, 26))
-          : (nextPlatformY + rand(-18, 18));
         if (isMobile && countPlatformsInYBand(y, MOBILE_SUB_BAND_DY) >= MOBILE_SUB_BAND_MAX){
           continue;
         }
@@ -792,6 +949,10 @@
         if (isBlockingCeiling(main, sub)) continue;
         if (isMobile && isBlockingMainRoute(main, sub)) continue;
         if (isMobile && prevMainForRoute && blocksAscentPath(prevMainForRoute, main, sub, 12)) continue;
+        if (isMobile && prevMainForRoute){
+          const trap = detectCeilingTrap(prevMainForRoute, [sub], true, true);
+          if (trap.trap) continue;
+        }
         let placeable = !overlapsAnyPlatform(sub, 8);
         for (let tries = 0; tries < 10 && !placeable; tries++){
           sub.x = rand(spawnMinX() + 2, spawnMaxX(sub.w) - 2);
@@ -867,7 +1028,7 @@
     if (mainPlatformCount <= 6) return;
     const chance = lerp(0.38, 0.28, difficulty);
     if (Math.random() > chance) return;
-    const type = Math.random() < 0.5 ? 'apple' : 'blueberry';
+    const type = Math.random() < 0.28 ? 'apple' : 'blueberry';
     pl.item = { type, phase: rand(0, Math.PI * 2) };
   }
 
