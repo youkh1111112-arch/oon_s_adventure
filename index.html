@@ -175,6 +175,15 @@
   const CRUMBLE_BREAK_SEC = 1.7;
   const AUTO_DECAY_START_SEC = 2.2;
   const AUTO_DECAY_BREAK_SEC = 5.2;
+  const SEA_BUBBLE_SPAWN_PER_SEC = 8.5;
+  const SEA_BUBBLE_MAX = 52;
+  const FISH_TARGET_H = 86;
+  const FISH_FALLBACK_ASPECT = 1.5;
+  const EEL_SPRITE_SRC = 'eel_3.png';
+  const FISH_MIN_SPAWN_OFFSET_Y = 420;
+  const FISH_SPAWN_GAP_MIN = 200;
+  const FISH_SPAWN_GAP_MAX = 290;
+  const FISH_HIT_COOLDOWN_MS = 900;
 
   // ===== World =====
   const player = {
@@ -198,12 +207,18 @@
   let storyShown = false;
   const debrisParticles = [];
   const breakCrackFx = [];
+  const seaBubbles = [];
+  const deepSeaFish = [];
   const spriteFxCanvas = document.createElement('canvas');
   const spriteFxCtx = spriteFxCanvas.getContext('2d');
+  let eelSpriteImg = null;
   const STORY_TOAST_TOTAL_MS = 1600;
   const STORY_TOAST_HIDE_AT_MS = 1200;
   let storyToastHideTimer = 0;
   let storyToastEndTimer = 0;
+  let seaBubbleSpawnAcc = 0;
+  let nextFishSpawnY = SPAWN_Y - FISH_MIN_SPAWN_OFFSET_Y;
+  let fishHitCooldownUntil = 0;
 
   function clearStoryToastTimers(){
     if (storyToastHideTimer){
@@ -383,7 +398,7 @@
     else w = rand(lerp(95, 68, difficulty), lerp(130, 105, difficulty));
     if (isMobile){
       const playW = WORLD_MAX_X - WORLD_MIN_X;
-      w = clamp(w * rand(1.10, 1.25), 84, Math.max(150, playW * 0.58));
+      w = clamp(w * rand(1.15, 1.30), 90, Math.max(165, playW * 0.62));
     }
 
     // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
@@ -507,20 +522,11 @@
     if (MAIN_ROUTE_DEBUG){
       console.log('[main-route]', mainRouteRecent.map((m) => `dx:${m.dx} dy:${m.dy} side:${m.side > 0 ? 'R' : 'L'}`).join(' | '));
     }
-    if (MAIN_DY_DEBUG){
-      const myAvg = dyBucket.reduce((a, b) => a + b, 0) / Math.max(1, dyBucket.length);
-      const otherMode = isMobile ? 'desktop' : 'mobile';
-      const otherBucket = mainDyRecent[otherMode];
-      const otherAvg = otherBucket.length
-        ? (otherBucket.reduce((a, b) => a + b, 0) / otherBucket.length)
-        : null;
-      const cmp = otherAvg === null
-        ? 'n/a'
-        : (myAvg > otherAvg ? 'true' : 'false');
+    if (MAIN_DY_DEBUG && isMobile){
+      const avgDy = dyBucket.reduce((a, b) => a + b, 0) / Math.max(1, dyBucket.length);
       console.log(
-        `[main-dy] mode:${dyMode} avg:${myAvg.toFixed(1)} ` +
-        `${otherMode}Avg:${otherAvg === null ? 'n/a' : otherAvg.toFixed(1)} ` +
-        `biggerThan${otherMode}:${cmp}`
+        `[main-dy-mobile] avg(last ${dyBucket.length})=${avgDy.toFixed(1)} ` +
+        `values=[${dyBucket.map((v) => String(v)).join(', ')}]`
       );
     }
 
@@ -540,25 +546,60 @@
       const isMobile = isMobileMode();
       const baseMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
       const baseMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), baseMinDy + 16, MAIN_MAX_DY);
-
-      let mainMinDy = baseMinDy;
-      let mainMaxDy = baseMaxDy;
+      const safeTop = REACH_MAX_DY - 8;
+      let boostScale = 1;
       if (isMobile){
-        const minScale = lerp(1.35, 1.45, difficulty);
-        const maxScale = lerp(1.50, 1.60, difficulty);
-        const safeTop = REACH_MAX_DY - 8;
-        mainMinDy = clamp(baseMinDy * minScale, 96, safeTop - 20);
-        mainMaxDy = clamp(baseMaxDy * maxScale, mainMinDy + 12, safeTop);
+        boostScale = rand(1.45, 1.75);
+      }
+      const dyBase = rand(baseMinDy, baseMaxDy) * boostScale;
+      const factors = isMobile ? [1.0, 0.9, 0.8, 0.7] : [1.0];
+      let main = null;
+
+      for (const factor of factors){
+        const tuneMinDy = isMobile
+          ? clamp(baseMinDy * boostScale * factor, 88, safeTop - 16)
+          : baseMinDy;
+        const tuneMaxDy = isMobile
+          ? clamp(baseMaxDy * boostScale * factor, tuneMinDy + 10, safeTop)
+          : baseMaxDy;
+        const dy = clamp(dyBase * factor, tuneMinDy, tuneMaxDy);
+        const targetY = anchorY - dy;
+
+        // spawnMainPlatform 내부 상태 변경이 있기 때문에, 실패 시 롤백할 수 있게 스냅샷 저장
+        const snapshot = {
+          lastPlatformX,
+          mainPlatformCount,
+          lastMainSide,
+          lastMainPlatform: lastMainPlatform ? { ...lastMainPlatform } : null,
+          routeLen: mainRouteRecent.length,
+          mobileDyLen: mainDyRecent.mobile.length,
+          desktopDyLen: mainDyRecent.desktop.length
+        };
+
+        const candidate = spawnMainPlatform(targetY, { minDy: tuneMinDy, maxDy: tuneMaxDy, isMobile });
+        const anchor = snapshot.lastMainPlatform;
+        const reachable = !anchor || isReachableFrom(anchor, candidate, difficulty);
+        if (reachable){
+          main = candidate;
+          break;
+        }
+
+        // fallback 단계로 내려가기 전 상태 복원
+        lastPlatformX = snapshot.lastPlatformX;
+        mainPlatformCount = snapshot.mainPlatformCount;
+        lastMainSide = snapshot.lastMainSide;
+        lastMainPlatform = snapshot.lastMainPlatform ? { ...snapshot.lastMainPlatform } : null;
+        mainRouteRecent.length = snapshot.routeLen;
+        mainDyRecent.mobile.length = snapshot.mobileDyLen;
+        mainDyRecent.desktop.length = snapshot.desktopDyLen;
       }
 
-      let dy = rand(mainMinDy, mainMaxDy);
-      // 모바일에서 gap이 너무 커져 실패할 경우를 대비한 점진 축소 fallback
-      if (isMobile){
-        dy = clamp(dy, mainMinDy * 0.92, REACH_MAX_DY - 8);
+      if (!main){
+        // 모든 모바일 fallback 실패 시 기본 범위로 보수적 재생성
+        const safeDy = rand(baseMinDy, baseMaxDy);
+        main = spawnMainPlatform(anchorY - safeDy, { minDy: baseMinDy, maxDy: baseMaxDy, isMobile });
       }
-      nextPlatformY = anchorY - dy;
 
-      const main = spawnMainPlatform(nextPlatformY, { minDy: mainMinDy, maxDy: mainMaxDy, isMobile });
       nextPlatformY = main.y;
       if (!main.keep && mainPlatformCount > 7){
         const crumbleChance = lerp(0.11, 0.23, difficulty);
@@ -569,7 +610,7 @@
 
       // 고도 상승 시에도 보조 발판 확률 하한을 높여 밀도 유지
       const subChanceBase = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
-      const subChance = isMobile ? clamp(subChanceBase * 0.6, 0.08, 0.42) : subChanceBase;
+      const subChance = isMobile ? clamp(subChanceBase * 0.55, 0.08, 0.36) : subChanceBase;
       if (Math.random() < subChance){
         const w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
         const y = nextPlatformY + rand(-18, 18);
@@ -711,6 +752,245 @@
     for (let i = breakCrackFx.length - 1; i >= 0; i--){
       breakCrackFx[i].life -= dt;
       if (breakCrackFx[i].life <= 0) breakCrackFx.splice(i, 1);
+    }
+  }
+
+  function spawnSeaBubble(){
+    const W = viewportW || Math.round(window.innerWidth);
+    seaBubbles.push({
+      x: rand(10, Math.max(12, W - 10)),
+      y: (viewportH || Math.round(window.innerHeight)) + rand(6, 38),
+      r: rand(1.8, 6.6),
+      vy: rand(26, 74),
+      swayAmp: rand(4, 18),
+      swaySpeed: rand(0.8, 2.2),
+      t: rand(0, Math.PI * 2),
+      alpha: rand(0.18, 0.52)
+    });
+  }
+
+  function updateSeaBubbles(dt){
+    const H = viewportH || Math.round(window.innerHeight);
+    seaBubbleSpawnAcc += dt * SEA_BUBBLE_SPAWN_PER_SEC;
+    while (seaBubbleSpawnAcc >= 1 && seaBubbles.length < SEA_BUBBLE_MAX){
+      seaBubbleSpawnAcc -= 1;
+      spawnSeaBubble();
+    }
+
+    for (let i = seaBubbles.length - 1; i >= 0; i--){
+      const b = seaBubbles[i];
+      b.t += dt * b.swaySpeed;
+      b.y -= b.vy * dt;
+      if (b.y + b.r < -40){
+        seaBubbles.splice(i, 1);
+      }
+    }
+
+    // Keep a few bubbles alive at all times.
+    if (seaBubbles.length < 6){
+      for (let i = seaBubbles.length; i < 6; i++) spawnSeaBubble();
+    }
+    // If viewport height changed, softly clamp far-off bubbles.
+    for (const b of seaBubbles){
+      if (b.y > H + 100) b.y = H + rand(8, 60);
+    }
+  }
+
+  function drawSeaBubbles(){
+    for (const b of seaBubbles){
+      const sx = b.x + Math.sin(b.t) * b.swayAmp;
+      const a = b.alpha * clamp(1 - b.y / Math.max(1, (viewportH || Math.round(window.innerHeight)) + 40), 0.2, 1);
+      ctx.strokeStyle = `rgba(168, 215, 255, ${a})`;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(sx, b.y, b.r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = `rgba(196, 232, 255, ${a * 0.26})`;
+      ctx.beginPath();
+      ctx.arc(sx + b.r * 0.15, b.y - b.r * 0.18, Math.max(0.8, b.r * 0.34), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function makeDeepSeaFish(y){
+    const aspect = eelSpriteImg
+      ? (eelSpriteImg.naturalWidth || eelSpriteImg.width || 1) / Math.max(1, (eelSpriteImg.naturalHeight || eelSpriteImg.height || 1))
+      : FISH_FALLBACK_ASPECT;
+    const fishH = FISH_TARGET_H;
+    const fishW = Math.max(56, Math.round(fishH * aspect));
+    const laneMinX = WORLD_MIN_X + 12;
+    const laneMaxX = WORLD_MAX_X - fishW - 12;
+    return {
+      x: rand(laneMinX, Math.max(laneMinX, laneMaxX)),
+      y,
+      w: fishW,
+      h: fishH,
+      dir: Math.random() < 0.5 ? -1 : 1,
+      speed: rand(58, 128),
+      phase: rand(0, Math.PI * 2),
+      bobAmp: rand(3, 8),
+      bobSpeed: rand(1.4, 2.6),
+      hue: Math.random() < 0.5 ? 'cyan' : 'indigo'
+    };
+  }
+
+  function fishWorldY(f, now){
+    return f.y + Math.sin(now * 0.001 * f.bobSpeed + f.phase) * f.bobAmp;
+  }
+
+  function generateFishUpTo(minY){
+    while (nextFishSpawnY > minY){
+      deepSeaFish.push(makeDeepSeaFish(nextFishSpawnY));
+      nextFishSpawnY -= rand(FISH_SPAWN_GAP_MIN, FISH_SPAWN_GAP_MAX);
+    }
+  }
+
+  function cleanupFish(viewH){
+    const cutoffY = cam.y + viewH + 280;
+    for (let i = deepSeaFish.length - 1; i >= 0; i--){
+      if (deepSeaFish[i].y > cutoffY) deepSeaFish.splice(i, 1);
+    }
+  }
+
+  function updateDeepSeaFish(dt, now){
+    const laneMinX = WORLD_MIN_X + 12;
+
+    for (const f of deepSeaFish){
+      const laneMaxX = WORLD_MAX_X - f.w - 12;
+      f.x += f.dir * f.speed * dt;
+      if (f.x <= laneMinX){
+        f.x = laneMinX;
+        f.dir = 1;
+      } else if (f.x >= laneMaxX){
+        f.x = laneMaxX;
+        f.dir = -1;
+      }
+    }
+
+    if (now < fishHitCooldownUntil) return;
+
+    for (const f of deepSeaFish){
+      const fy = fishWorldY(f, now);
+      if (!aabb(player.x, player.y, player.w, player.h, f.x, fy, f.w, f.h)) continue;
+
+      const fishCx = f.x + f.w * 0.5;
+      const playerCx = player.x + player.w * 0.5;
+      const pushDir = playerCx <= fishCx ? -1 : 1;
+      player.vx = pushDir * Math.max(180, Math.abs(player.vx) + 80);
+      player.vy = Math.max(player.vy, 980);
+      player.onGround = false;
+      player.groundPlatform = null;
+      residualMomentum.strength = 0;
+      fishHitCooldownUntil = now + FISH_HIT_COOLDOWN_MS;
+      break;
+    }
+  }
+
+  function drawDeepSeaFish(now){
+    for (const f of deepSeaFish){
+      const fy = fishWorldY(f, now);
+      const sy = fy - cam.y;
+      if (eelSpriteImg){
+        const facing = f.dir >= 0 ? -1 : 1;
+        const cx = Math.round(f.x + f.w * 0.5);
+        const cy = Math.round(sy + f.h * 0.5);
+        const wriggle = Math.sin(now * 0.009 + f.phase);
+        const breathe = Math.sin(now * 0.0055 + f.phase * 0.9);
+        const rot = wriggle * 0.055;
+        const scaleX = 1 + wriggle * 0.02;
+        const scaleY = 1 + breathe * 0.04;
+        const dw = Math.max(1, Math.round(f.w));
+        const dh = Math.max(1, Math.round(f.h));
+
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(rot);
+        ctx.scale(facing, 1);
+        ctx.scale(scaleX, scaleY);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(eelSpriteImg, -dw * 0.5, -dh * 0.5, dw, dh);
+        ctx.restore();
+        continue;
+      }
+
+      const body = f.hue === 'cyan' ? '#1f5568' : '#313a74';
+      const bodyDark = f.hue === 'cyan' ? '#123645' : '#1c224f';
+      const finEdge = f.hue === 'cyan' ? '#3f7e96' : '#5561a3';
+      const teeth = '#ecf4ff';
+      const eye = '#edf5ff';
+      const facing = f.dir >= 0 ? 1 : -1;
+      const cx = f.x + f.w * 0.5;
+      const cy = sy + f.h * 0.5;
+
+      // Body
+      ctx.fillStyle = body;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, f.w * 0.38, f.h * 0.42, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Tail
+      ctx.fillStyle = bodyDark;
+      ctx.beginPath();
+      ctx.moveTo(cx - facing * f.w * 0.40, cy);
+      ctx.lineTo(cx - facing * f.w * 0.58, cy - f.h * 0.24);
+      ctx.lineTo(cx - facing * f.w * 0.58, cy + f.h * 0.24);
+      ctx.closePath();
+      ctx.fill();
+
+      // Dorsal fin
+      ctx.fillStyle = finEdge;
+      ctx.beginPath();
+      ctx.moveTo(cx - f.w * 0.04, cy - f.h * 0.30);
+      ctx.lineTo(cx + f.w * 0.12, cy - f.h * 0.52);
+      ctx.lineTo(cx + f.w * 0.20, cy - f.h * 0.24);
+      ctx.closePath();
+      ctx.fill();
+
+      // Mouth slit
+      const mouthX = cx + facing * f.w * 0.28;
+      const mouthY = cy + f.h * 0.08;
+      ctx.strokeStyle = '#0d1222';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(mouthX - facing * 8, mouthY - 1);
+      ctx.lineTo(mouthX + facing * 4, mouthY + 1);
+      ctx.stroke();
+
+      // Teeth (small spikes)
+      ctx.fillStyle = teeth;
+      const toothDir = facing > 0 ? 1 : -1;
+      for (let i = 0; i < 4; i++){
+        const tx = mouthX - toothDir * (6 - i * 3.4);
+        const ty = mouthY - 1;
+        ctx.beginPath();
+        ctx.moveTo(tx, ty);
+        ctx.lineTo(tx + toothDir * 2.1, ty + 0.6);
+        ctx.lineTo(tx + toothDir * 0.9, ty + 3.6);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // Angry half-circle eye
+      ctx.fillStyle = eye;
+      ctx.beginPath();
+      ctx.arc(cx + facing * f.w * 0.20, cy - f.h * 0.08, f.h * 0.12, Math.PI, 0);
+      ctx.lineTo(cx + facing * f.w * 0.20 + f.h * 0.12, cy - f.h * 0.08);
+      ctx.closePath();
+      ctx.fill();
+
+      // Pupil + angry brow
+      ctx.fillStyle = '#11192a';
+      ctx.beginPath();
+      ctx.arc(cx + facing * f.w * 0.21, cy - f.h * 0.10, f.h * 0.045, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = '#0b1020';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(cx + facing * f.w * 0.12, cy - f.h * 0.18);
+      ctx.lineTo(cx + facing * f.w * 0.30, cy - f.h * 0.26);
+      ctx.stroke();
     }
   }
 
@@ -958,6 +1238,17 @@
     img.src = FIXED_SPRITE_SRC;
   }
 
+  function loadEelSprite(){
+    const img = new Image();
+    img.onload = () => {
+      eelSpriteImg = img;
+    };
+    img.onerror = () => {
+      console.warn(`[jumpking_proto] failed to load eel sprite: ${EEL_SPRITE_SRC}`);
+    };
+    img.src = EEL_SPRITE_SRC;
+  }
+
   function drawPixelSprite(kind, x, y, facing = 1, tint = null){
     if (fixedSpriteImg){
       const trim = fixedSpriteTrim || {
@@ -1009,15 +1300,16 @@
         const legX0 = Math.floor(dw * 0.13);
         const legY = Math.floor(dh * 0.74);
         const legH = Math.floor(6 + stretch * JUMP_LEG_STRETCH_MAX);
+        const legXFront = facing < 0
+          ? Math.floor(dw - legX0 - legW)
+          : legX0;
+        const legXRear = facing < 0
+          ? Math.floor(dw - (legX0 + legGap) - legW)
+          : (legX0 + legGap);
 
         ctx.fillStyle = fixedSpriteLegColor;
-        if (facing < 0){
-          ctx.fillRect(legX0, legY, legW, legH);
-          ctx.fillRect(legX0 + legGap, legY + 1, legW, Math.max(3, legH - 1));
-        } else {
-          ctx.fillRect(ox + legX0, oy + legY, legW, legH);
-          ctx.fillRect(ox + legX0 + legGap, oy + legY + 1, legW, Math.max(3, legH - 1));
-        }
+        ctx.fillRect(ox + legXFront, oy + legY, legW, legH);
+        ctx.fillRect(ox + legXRear, oy + legY + 1, legW, Math.max(3, legH - 1));
       }
       ctx.restore();
       return;
@@ -1051,9 +1343,11 @@
   }
 
   function hitPlayerScreen(px, py){
+    const mobilePad = isMobileMode() ? 16 : 0;
+    const hitPad = INPUT_HIT_PAD + mobilePad;
     const s = { x: player.x, y: (player.y - cam.y) };
-    return px >= s.x - INPUT_HIT_PAD && px <= s.x + player.w + INPUT_HIT_PAD
-      && py >= s.y - INPUT_HIT_PAD && py <= s.y + player.h + INPUT_HIT_PAD;
+    return px >= s.x - hitPad && px <= s.x + player.w + hitPad
+      && py >= s.y - hitPad && py <= s.y + player.h + hitPad;
   }
 
   function beginAim(e){
@@ -1142,6 +1436,14 @@
     return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
   }
 
+  function applyWrapX(){
+    if (player.x + player.w < WORLD_MIN_X){
+      player.x = WORLD_MAX_X;
+    } else if (player.x > WORLD_MAX_X){
+      player.x = WORLD_MIN_X - player.w;
+    }
+  }
+
   function applyCollisionMomentum(blockAxis, impactSpeed){
     if (residualMomentum.strength < MOMENTUM_MIN_POWER) return false;
     if (impactSpeed < MOMENTUM_IMPACT_SPEED) return false;
@@ -1201,6 +1503,7 @@
       else if (player.vx < 0) player.x = pl.x + pl.w;
       if (!applyCollisionMomentum('x', impactX)) player.vx = 0;
     }
+    applyWrapX();
 
     // Y move
     player.y += player.vy * dt;
@@ -1342,6 +1645,11 @@
     storyToastEl.classList.remove('show', 'hide');
     debrisParticles.length = 0;
     breakCrackFx.length = 0;
+    seaBubbles.length = 0;
+    seaBubbleSpawnAcc = 0;
+    deepSeaFish.length = 0;
+    nextFishSpawnY = SPAWN_Y - FISH_MIN_SPAWN_OFFSET_Y;
+    fishHitCooldownUntil = 0;
     jumpStretchUntil = 0;
     playerFacing = 1;
     rankSubmittedThisRound = false;
@@ -1368,6 +1676,7 @@
       updateAutoDecayPlatforms(dt);
       updateItemCollection(now);
       updateEffects(dt);
+      updateSeaBubbles(dt);
 
       if (player.y < bestY) bestY = player.y;
 
@@ -1397,6 +1706,7 @@
 
     ctx.fillStyle = '#0b0f19';
     ctx.fillRect(0,0,W,H);
+    drawSeaBubbles();
 
     for (const pl of platforms){
       if (pl.broken) continue;
@@ -1515,6 +1825,7 @@ POS    (0, ${(hudOriginY - player.y).toFixed(0)})`;
   updateWorldBounds();
   seedBasePlatforms();
   loadFixedSprite();
+  loadEelSprite();
   generatePlatformsUpTo(player.y - (viewportH || Math.round(window.innerHeight)) * 2.2);
   requestAnimationFrame(tick);
 })();
