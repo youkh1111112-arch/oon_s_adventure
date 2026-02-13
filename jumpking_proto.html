@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>JumpKing-like Prototype (Charge Jump)</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b0f19; overflow:hidden; }
+    #wrap { position:relative; width:100%; height:100%; }
+    canvas { display:block; width:100%; height:100%; touch-action:none; }
+    .hud{
+      position:absolute; left:12px; top:10px; color:#dbe3ff;
+      font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      opacity:.92; user-select:none; pointer-events:none;
+      white-space:pre;
+    }
+    .hint{
+      position:absolute; left:12px; bottom:10px; color:#b9c6ff;
+      font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      opacity:.8; user-select:none; pointer-events:none;
+    }
+    .overlay{
+      position:absolute; inset:0; display:grid; place-items:center;
+      background:rgba(6,10,20,.62);
+      opacity:0; pointer-events:none;
+      transition:opacity .15s ease;
+    }
+    .overlay.show{ opacity:1; pointer-events:auto; }
+    .panel{
+      text-align:center; color:#f4f7ff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    .panel h2{
+      margin:0 0 12px; font-size:44px; letter-spacing:.06em; font-weight:800;
+    }
+    .restart-btn{
+      border:1px solid #5f84ff; background:#1d2c62; color:#e9f1ff;
+      font:600 15px/1 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      padding:11px 18px; border-radius:10px; cursor:pointer;
+    }
+    .restart-btn:hover{ background:#24397e; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div class="hud" id="hud"></div>
+  <div class="hint">캐릭터 위에서 드래그(아래로 당길수록 강함) → 손 떼면 점프. 완전 정지해야 조작 가능.</div>
+  <div id="gameOverOverlay" class="overlay">
+    <div class="panel">
+      <h2>GAME OVER</h2>
+      <button id="restartBtn" class="restart-btn" type="button">Restart</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ===== Canvas =====
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha:false });
+  const hud = document.getElementById('hud');
+  const gameOverOverlay = document.getElementById('gameOverOverlay');
+  const restartBtn = document.getElementById('restartBtn');
+
+  function DPR(){ return Math.max(1, Math.min(2, window.devicePixelRatio || 1)); }
+  function resize(){
+    const dpr = DPR();
+    canvas.width = Math.floor(canvas.clientWidth * dpr);
+    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener('resize', resize, { passive:true });
+  resize();
+
+  // ===== Tuning =====
+  const GRAVITY = 2200;
+  const AIR_DAMP = 0.995;
+  const GROUND_DAMP = 0.55;
+  const STATIC_VX_EPS = 12;
+  const STATIC_VY_EPS = 12;
+
+  const MAX_PULL = 160;
+  const MAX_JUMP_VY = 980;
+  const MAX_JUMP_VX = 520;
+  const MIN_PULL_TO_JUMP = 18;
+  const MOMENTUM_MIN_POWER = 0.68;
+  const MOMENTUM_IMPACT_SPEED = 260;
+  const PLAYER_SPRITE_KIND = 'cat'; // 'cat' | 'dog'
+  const FIXED_SPRITE_SRC = 'oon_02_sit.png';
+  const IDLE_BOB_AMPLITUDE = 0.9;
+  const IDLE_BOB_SPEED = 0.0046;
+  const PLAYER_W = 42;
+  const PLAYER_H = 56;
+  const INPUT_HIT_PAD = 8;
+  const JUMP_LEG_STRETCH_MS = 420;
+  const JUMP_LEG_STRETCH_MAX = 19;
+
+  const BOTTOM_OUT_MARGIN = 0;
+  const SPAWN_Y = 560 - PLAYER_H;
+  const PLAYFIELD_TARGET_W = 640;
+  const PLAYFIELD_MIN_W = 320;
+  const PLAYFIELD_SIDE_MARGIN = 24;
+
+  // ===== World =====
+  const player = {
+    x: 0, y: SPAWN_Y, w: PLAYER_W, h: PLAYER_H,
+    vx: 0, vy: 0,
+    onGround: false
+  };
+  const cam = { y: 0 };
+  let isGameOver = false;
+  let frozenElapsedSec = null;
+  const residualMomentum = { dirX: 0, dirY: -1, strength: 0 };
+  let playerFacing = 1; // 1:right, -1:left
+  let jumpStretchUntil = 0;
+
+  function isFullyStopped(){
+    return player.onGround && Math.abs(player.vx) < STATIC_VX_EPS && Math.abs(player.vy) < STATIC_VY_EPS;
+  }
+
+  function isIdleAnimating(){
+    return !isGameOver
+      && !input.aiming
+      && player.onGround
+      && Math.abs(player.vx) < 10
+      && Math.abs(player.vy) < 10;
+  }
+
+  // ===== Platform Generation =====
+  let WORLD_MIN_X = 0;
+  let WORLD_MAX_X = 0;
+  const platforms = [];
+  let nextPlatformY = 560;
+  let lastPlatformX = 120;
+  let mainPlatformCount = 0;
+  let lastMainSide = 0;
+
+  function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+  function rand(min, max){ return min + Math.random() * (max - min); }
+  function lerp(a,b,t){ return a + (b - a) * t; }
+  function worldCenterX(){ return (WORLD_MIN_X + WORLD_MAX_X) * 0.5; }
+
+  function updateWorldBounds(){
+    const W = canvas.clientWidth;
+    const playW = Math.min(PLAYFIELD_TARGET_W, Math.max(PLAYFIELD_MIN_W, W - PLAYFIELD_SIDE_MARGIN * 2));
+    WORLD_MIN_X = (W - playW) * 0.5;
+    WORLD_MAX_X = WORLD_MIN_X + playW;
+  }
+
+  function seedBasePlatforms(){
+    const playW = WORLD_MAX_X - WORLD_MIN_X;
+    const groundPad = 260;
+    const startW = 180;
+    const startX = clamp(worldCenterX() - startW * 0.5, WORLD_MIN_X + 24, WORLD_MAX_X - startW - 24);
+
+    platforms.length = 0;
+    platforms.push(
+      { x: WORLD_MIN_X - groundPad, y: 640, w: playW + groundPad * 2, h: 50, keep: true },
+      { x: startX, y: 560, w: startW, h: 16, keep: true }
+    );
+
+    nextPlatformY = 560;
+    lastPlatformX = startX;
+    mainPlatformCount = 0;
+    lastMainSide = 0;
+    player.x = startX + (startW - player.w) * 0.5;
+    player.y = SPAWN_Y;
+  }
+
+  function spawnMainPlatform(y){
+    const center = worldCenterX();
+    const climb = Math.max(0, SPAWN_Y - y);
+    const difficulty = clamp(climb / 4200, 0, 1);
+    const w = rand(lerp(160, 100, difficulty), lerp(230, 160, difficulty));
+
+    let x;
+    // 초반은 좌우 교차 배치로 쉽게 진행
+    if (mainPlatformCount < 10){
+      const nextSide = lastMainSide <= 0 ? 1 : -1;
+      const pad = 26;
+      if (nextSide < 0){
+        const maxLeft = Math.max(WORLD_MIN_X + pad, center - w - 34);
+        x = rand(WORLD_MIN_X + pad, maxLeft);
+      } else {
+        const minRight = Math.min(WORLD_MAX_X - w - pad, center + 34);
+        x = rand(minRight, WORLD_MAX_X - w - pad);
+      }
+      lastMainSide = nextSide;
+    } else {
+      const drift = rand(lerp(130, 220, difficulty), lerp(240, 340, difficulty));
+      const dir = Math.random() < 0.5 ? -1 : 1;
+      const rawX = lastPlatformX + dir * drift;
+      x = clamp(rawX, WORLD_MIN_X + 18, WORLD_MAX_X - w - 18);
+      lastMainSide = (x + w * 0.5) < center ? -1 : 1;
+    }
+
+    lastPlatformX = x;
+    mainPlatformCount += 1;
+    return { x, y, w, h: 16 };
+  }
+
+  function generatePlatformsUpTo(minY){
+    while (nextPlatformY > minY){
+      const climbNow = Math.max(0, SPAWN_Y - nextPlatformY);
+      const difficulty = clamp(climbNow / 4200, 0, 1);
+      const gap = rand(lerp(70, 96, difficulty), lerp(108, 170, difficulty));
+      nextPlatformY -= gap;
+
+      const main = spawnMainPlatform(nextPlatformY);
+      platforms.push(main);
+
+      const subChance = lerp(0.42, 0.16, difficulty);
+      if (Math.random() < subChance){
+        const w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
+        const y = nextPlatformY + rand(-18, 18);
+        let x = rand(WORLD_MIN_X, WORLD_MAX_X - w);
+        const mainCenter = main.x + main.w * 0.5;
+        const subCenter = x + w * 0.5;
+        if (Math.abs(subCenter - mainCenter) < 200){
+          x = subCenter < mainCenter
+            ? clamp(main.x - rand(240, 340), WORLD_MIN_X, WORLD_MAX_X - w)
+            : clamp(main.x + rand(240, 340), WORLD_MIN_X, WORLD_MAX_X - w);
+        }
+        platforms.push({ x, y, w, h: 14 });
+      }
+    }
+  }
+
+  function cleanupPlatforms(viewH){
+    const cutoffY = cam.y + viewH + 1000;
+    for (let i = platforms.length - 1; i >= 0; i--){
+      const pl = platforms[i];
+      if (pl.keep) continue;
+      if (pl.y > cutoffY) platforms.splice(i, 1);
+    }
+  }
+
+  // ===== Score & Time =====
+  let startY = player.y;
+  let bestY = player.y;
+  let t0 = performance.now();
+
+  function score(){
+    return Math.max(0, Math.floor((startY - bestY) / 10));
+  }
+  function elapsedSec(){
+    if (frozenElapsedSec !== null) return frozenElapsedSec;
+    return Math.floor((performance.now() - t0) / 1000);
+  }
+
+  // ===== Input: Charge Jump =====
+  const input = {
+    aiming: false,
+    pid: null,
+    startX: 0, startY: 0,
+    curX: 0, curY: 0,
+    pullX: 0, pullY: 0,
+  };
+
+  function pointerPos(e){
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  const PLAYER_SPRITES = {
+    cat: [
+      '.1.......1...',
+      '11.1...1.11..',
+      '1ww1111ww11..',
+      '1wwwwwwwww11.',
+      '1w2www2www11.',
+      '1wwwwwwwww11.',
+      '.1w333333w11.',
+      '.1wwwwwwww11.',
+      '.1ww1ww1ww11.',
+      '.1wwwwwwww11.',
+      '.1ww4444ww11.',
+      '.1www44www11.',
+      '..11111111...',
+      '..1......1...',
+      '.11......11..',
+      '.1........1..',
+      '11........11.',
+    ],
+    dog: [
+      '.111.....111.',
+      '.1bb1...1bb1.',
+      '11bbb111bbb11',
+      '1bbbbbbbbbbb1',
+      '1bb2bbbb2bbb1',
+      '1bbbbbbbbbbb1',
+      '1bbb33333bbb1',
+      '.1bbbbbbbbb1.',
+      '.1bbb1b1bbb1.',
+      '.1bbbbbbbbb1.',
+      '.1bbb444bbb1.',
+      '..1bb444bb1..',
+      '..111111111..',
+      '..1.......1..',
+      '.11.......11.',
+      '.1.........1.',
+      '11.........11',
+    ],
+  };
+  const PLAYER_PALETTES = {
+    cat: { '1':'#1f2f66', 'w':'#eaf1ff', '2':'#6b8cff', '3':'#ff9eb4', '4':'#d8e4ff', 'b':'#f5d7af' },
+    dog: { '1':'#1f2f66', 'w':'#eaf1ff', '2':'#6b8cff', '3':'#3f3020', '4':'#f3eadb', 'b':'#deb37f' },
+  };
+  let fixedSpriteImg = null;
+  let fixedSpriteTrim = null;
+  let fixedSpriteLegColor = '#2a2f40';
+
+  function computeOpaqueBounds(img){
+    const iw = img.naturalWidth || img.width || 1;
+    const ih = img.naturalHeight || img.height || 1;
+    const off = document.createElement('canvas');
+    off.width = iw;
+    off.height = ih;
+    const octx = off.getContext('2d', { willReadFrequently:true });
+    octx.clearRect(0, 0, iw, ih);
+    octx.drawImage(img, 0, 0, iw, ih);
+
+    const { data } = octx.getImageData(0, 0, iw, ih);
+    let minX = iw, minY = ih, maxX = -1, maxY = -1;
+    for (let y = 0; y < ih; y++){
+      for (let x = 0; x < iw; x++){
+        const a = data[(y * iw + x) * 4 + 3];
+        if (a < 10) continue;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+
+    if (maxX < minX || maxY < minY){
+      return { sx: 0, sy: 0, sw: iw, sh: ih };
+    }
+    return { sx: minX, sy: minY, sw: (maxX - minX + 1), sh: (maxY - minY + 1) };
+  }
+
+  function computeRearLegColor(img, trim){
+    const iw = img.naturalWidth || img.width || 1;
+    const ih = img.naturalHeight || img.height || 1;
+    const off = document.createElement('canvas');
+    off.width = iw;
+    off.height = ih;
+    const octx = off.getContext('2d', { willReadFrequently:true });
+    octx.clearRect(0, 0, iw, ih);
+    octx.drawImage(img, 0, 0, iw, ih);
+    const { data } = octx.getImageData(0, 0, iw, ih);
+
+    const rx0 = Math.floor(trim.sx + trim.sw * 0.00);
+    const rx1 = Math.ceil(trim.sx + trim.sw * 0.45);
+    const ry0 = Math.floor(trim.sy + trim.sh * 0.55);
+    const ry1 = Math.ceil(trim.sy + trim.sh * 1.00);
+
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let y = ry0; y < ry1; y++){
+      for (let x = rx0; x < rx1; x++){
+        const a = data[(y * iw + x) * 4 + 3];
+        if (a < 20) continue;
+        const j = (y * iw + x) * 4;
+        r += data[j];
+        g += data[j + 1];
+        b += data[j + 2];
+        n += 1;
+      }
+    }
+    if (n === 0) return '#2a2f40';
+    const rr = Math.round(r / n).toString(16).padStart(2, '0');
+    const gg = Math.round(g / n).toString(16).padStart(2, '0');
+    const bb = Math.round(b / n).toString(16).padStart(2, '0');
+    return `#${rr}${gg}${bb}`;
+  }
+
+  function getJumpLegStretch(now){
+    if (isGameOver || player.onGround) return 0;
+    const launchStretch = clamp((jumpStretchUntil - now) / JUMP_LEG_STRETCH_MS, 0, 1);
+    const airStretch = clamp((-player.vy - 40) / 560, 0, 1) * 0.85;
+    return Math.max(launchStretch, airStretch);
+  }
+
+  function loadFixedSprite(){
+    const img = new Image();
+    img.onload = () => {
+      fixedSpriteImg = img;
+      fixedSpriteTrim = computeOpaqueBounds(img);
+      fixedSpriteLegColor = computeRearLegColor(img, fixedSpriteTrim);
+    };
+    img.onerror = () => {
+      console.warn(`[jumpking_proto] failed to load fixed sprite: ${FIXED_SPRITE_SRC}`);
+    };
+    img.src = FIXED_SPRITE_SRC;
+  }
+
+  function drawPixelSprite(kind, x, y, facing = 1){
+    if (fixedSpriteImg){
+      const trim = fixedSpriteTrim || {
+        sx: 0,
+        sy: 0,
+        sw: (fixedSpriteImg.naturalWidth || fixedSpriteImg.width || 1),
+        sh: (fixedSpriteImg.naturalHeight || fixedSpriteImg.height || 1)
+      };
+      const scale = Math.min(player.w / trim.sw, player.h / trim.sh);
+      const dw = trim.sw * scale;
+      const dh = trim.sh * scale;
+      const ox = x + (player.w - dw) * 0.5;
+      const oy = y + (player.h - dh);
+      const stretch = getJumpLegStretch(performance.now());
+
+      ctx.save();
+      ctx.imageSmoothingEnabled = false;
+      if (facing < 0){
+        ctx.translate(ox + dw, oy);
+        ctx.scale(-1, 1);
+        ctx.drawImage(fixedSpriteImg, trim.sx, trim.sy, trim.sw, trim.sh, 0, 0, dw, dh);
+      } else {
+        ctx.drawImage(fixedSpriteImg, trim.sx, trim.sy, trim.sw, trim.sh, ox, oy, dw, dh);
+      }
+
+      if (stretch > 0.01){
+        const legW = Math.max(2, Math.floor(dw * 0.09));
+        const legGap = Math.max(3, Math.floor(dw * 0.12));
+        const legX0 = Math.floor(dw * 0.13);
+        const legY = Math.floor(dh * 0.74);
+        const legH = Math.floor(6 + stretch * JUMP_LEG_STRETCH_MAX);
+
+        ctx.fillStyle = fixedSpriteLegColor;
+        if (facing < 0){
+          ctx.fillRect(legX0, legY, legW, legH);
+          ctx.fillRect(legX0 + legGap, legY + 1, legW, Math.max(3, legH - 1));
+        } else {
+          ctx.fillRect(ox + legX0, oy + legY, legW, legH);
+          ctx.fillRect(ox + legX0 + legGap, oy + legY + 1, legW, Math.max(3, legH - 1));
+        }
+      }
+      ctx.restore();
+      return;
+    }
+
+    const sprite = PLAYER_SPRITES[kind] || PLAYER_SPRITES.cat;
+    const palette = PLAYER_PALETTES[kind] || PLAYER_PALETTES.cat;
+    const scale = Math.min(player.w / sprite[0].length, player.h / sprite.length);
+    const ox = x + (player.w - sprite[0].length * scale) * 0.5;
+    const oy = y + (player.h - sprite.length * scale) * 0.5;
+
+    for (let r = 0; r < sprite.length; r++){
+      const row = sprite[r];
+      for (let c = 0; c < row.length; c++){
+        const ch = row[c];
+        if (ch === '.') continue;
+        const color = palette[ch];
+        if (!color) continue;
+        const cc = facing < 0 ? (row.length - 1 - c) : c;
+        ctx.fillStyle = color;
+        ctx.fillRect(ox + cc * scale, oy + r * scale, scale, scale);
+      }
+    }
+  }
+
+  function playerScreenCenter(){
+    return {
+      x: player.x + player.w/2,
+      y: (player.y - cam.y) + player.h/2
+    };
+  }
+
+  function hitPlayerScreen(px, py){
+    const s = { x: player.x, y: (player.y - cam.y) };
+    return px >= s.x - INPUT_HIT_PAD && px <= s.x + player.w + INPUT_HIT_PAD
+      && py >= s.y - INPUT_HIT_PAD && py <= s.y + player.h + INPUT_HIT_PAD;
+  }
+
+  function beginAim(e){
+    if (isGameOver) return;
+    if (!isFullyStopped()) return;
+
+    const p = pointerPos(e);
+    if (!hitPlayerScreen(p.x, p.y)) return;
+
+    const c = playerScreenCenter();
+
+    input.aiming = true;
+    input.pid = e.pointerId;
+    input.startX = c.x;
+    input.startY = c.y;
+    input.curX = p.x;
+    input.curY = p.y;
+    input.pullX = 0;
+    input.pullY = 0;
+
+    canvas.setPointerCapture?.(e.pointerId);
+  }
+
+  function moveAim(e){
+    if (isGameOver) return;
+    if (!input.aiming || e.pointerId !== input.pid) return;
+
+    const p = pointerPos(e);
+    input.curX = p.x;
+    input.curY = p.y;
+
+    let dx = input.curX - input.startX;
+    let dy = input.curY - input.startY;
+    dy = Math.max(0, dy);
+
+    dx = clamp(dx, -MAX_PULL, MAX_PULL);
+    dy = clamp(dy, 0, MAX_PULL);
+
+    const dist = Math.hypot(dx, dy);
+    if (dist > MAX_PULL){
+      const s = MAX_PULL / dist;
+      dx *= s;
+      dy *= s;
+    }
+
+    input.pullX = dx;
+    input.pullY = dy;
+  }
+
+  function endAim(e){
+    if (isGameOver) return;
+    if (!input.aiming || e.pointerId !== input.pid) return;
+
+    const pullLen = Math.hypot(input.pullX, input.pullY);
+
+    input.aiming = false;
+    input.pid = null;
+
+    if (pullLen < MIN_PULL_TO_JUMP) return;
+
+    const power = clamp(pullLen / MAX_PULL, 0, 1);
+    const vy = -power * MAX_JUMP_VY;
+    const vx = (input.pullX / MAX_PULL) * MAX_JUMP_VX * power;
+
+    player.vx = vx;
+    player.vy = vy;
+    player.onGround = false;
+    jumpStretchUntil = performance.now() + JUMP_LEG_STRETCH_MS;
+    if (Math.abs(vx) > 8) playerFacing = Math.sign(vx);
+
+    const n = Math.hypot(vx, vy) || 1;
+    residualMomentum.dirX = vx / n;
+    residualMomentum.dirY = vy / n;
+    residualMomentum.strength = power;
+  }
+
+  canvas.addEventListener('pointerdown', (e)=>{ e.preventDefault(); beginAim(e); }, { passive:false });
+  canvas.addEventListener('pointermove', (e)=>{ if(input.aiming) e.preventDefault(); moveAim(e); }, { passive:false });
+  canvas.addEventListener('pointerup',   (e)=>{ e.preventDefault(); endAim(e); }, { passive:false });
+  canvas.addEventListener('pointercancel',(e)=>{ endAim(e); }, { passive:true });
+
+  // ===== Collision =====
+  function aabb(ax,ay,aw,ah,bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function applyCollisionMomentum(blockAxis, impactSpeed){
+    if (residualMomentum.strength < MOMENTUM_MIN_POWER) return false;
+    if (impactSpeed < MOMENTUM_IMPACT_SPEED) return false;
+
+    const carry = clamp((residualMomentum.strength - MOMENTUM_MIN_POWER) / (1 - MOMENTUM_MIN_POWER), 0, 1);
+
+    if (blockAxis === 'x'){
+      const tangentDir = residualMomentum.dirY !== 0
+        ? Math.sign(residualMomentum.dirY)
+        : (player.vy === 0 ? -1 : Math.sign(player.vy));
+      const tangentGain = Math.max(80, impactSpeed * (0.16 + 0.26 * carry));
+      player.vy += tangentDir * tangentGain;
+      player.vx = -Math.sign(player.vx || residualMomentum.dirX || 1) * Math.min(90, impactSpeed * 0.14);
+    } else {
+      const tangentDir = residualMomentum.dirX !== 0
+        ? Math.sign(residualMomentum.dirX)
+        : (player.vx === 0 ? 0 : Math.sign(player.vx));
+      const tangentGain = Math.max(70, impactSpeed * (0.20 + 0.34 * carry));
+      player.vx += tangentDir * tangentGain;
+      player.vy = Math.max(player.vy, 40);
+    }
+
+    residualMomentum.strength *= 0.72;
+    return true;
+  }
+
+  function resolve(dt){
+    player.onGround = false;
+    const prevY = player.y;
+
+    // X move
+    player.x += player.vx * dt;
+    if (Math.abs(player.vx) > 18) playerFacing = Math.sign(player.vx);
+    for (const pl of platforms){
+      if (!aabb(player.x, player.y, player.w, player.h, pl.x, pl.y, pl.w, pl.h)) continue;
+      const impactX = Math.abs(player.vx);
+      if (player.vx > 0) player.x = pl.x - player.w;
+      else if (player.vx < 0) player.x = pl.x + pl.w;
+      if (!applyCollisionMomentum('x', impactX)) player.vx = 0;
+    }
+
+    // Y move
+    player.y += player.vy * dt;
+    for (const pl of platforms){
+      const overlapsX = player.x < pl.x + pl.w && player.x + player.w > pl.x;
+      if (!overlapsX) continue;
+
+      const prevTop = prevY;
+      const prevBottom = prevY + player.h;
+      const curTop = player.y;
+      const curBottom = player.y + player.h;
+
+      if (player.vy > 0){
+        if (prevBottom <= pl.y && curBottom >= pl.y){
+          player.y = pl.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+          continue;
+        }
+      } else if (player.vy < 0){
+        const plBottom = pl.y + pl.h;
+        if (prevTop >= plBottom && curTop <= plBottom){
+          const impactY = Math.abs(player.vy);
+          player.y = plBottom;
+          if (!applyCollisionMomentum('y', impactY)) player.vy = 0;
+          continue;
+        }
+      }
+
+      if (!aabb(player.x, player.y, player.w, player.h, pl.x, pl.y, pl.w, pl.h)) continue;
+      if (player.vy >= 0){
+        player.y = pl.y - player.h;
+        player.vy = 0;
+        player.onGround = true;
+      } else {
+        const impactY = Math.abs(player.vy);
+        player.y = pl.y + pl.h;
+        if (!applyCollisionMomentum('y', impactY)) player.vy = 0;
+      }
+    }
+
+    if (player.onGround){
+      player.vx *= GROUND_DAMP;
+      if (Math.abs(player.vx) < STATIC_VX_EPS) player.vx = 0;
+      if (Math.abs(player.vy) < STATIC_VY_EPS) player.vy = 0;
+      residualMomentum.strength *= 0.88;
+    } else {
+      residualMomentum.strength *= 0.996;
+    }
+    if (residualMomentum.strength < 0.02){
+      residualMomentum.strength = 0;
+    }
+  }
+
+  function setGameOver(v){
+    isGameOver = v;
+    gameOverOverlay.classList.toggle('show', v);
+    if (v){
+      if (frozenElapsedSec === null) frozenElapsedSec = Math.floor((performance.now() - t0) / 1000);
+      input.aiming = false;
+      input.pid = null;
+    } else {
+      frozenElapsedSec = null;
+    }
+  }
+
+  function checkGameOver(){
+    const H = canvas.clientHeight;
+    const outBelow = (player.y - cam.y) > (H + BOTTOM_OUT_MARGIN);
+    if (outBelow) setGameOver(true);
+  }
+
+  function resetGame(){
+    updateWorldBounds();
+    seedBasePlatforms();
+    player.vx = 0;
+    player.vy = 0;
+    player.onGround = false;
+    cam.y = 0;
+
+    generatePlatformsUpTo(player.y - canvas.clientHeight * 2.2);
+
+    startY = player.y;
+    bestY = player.y;
+    t0 = performance.now();
+    frozenElapsedSec = null;
+
+    input.aiming = false;
+    input.pid = null;
+    residualMomentum.dirX = 0;
+    residualMomentum.dirY = -1;
+    residualMomentum.strength = 0;
+    jumpStretchUntil = 0;
+    playerFacing = 1;
+    setGameOver(false);
+  }
+
+  restartBtn.addEventListener('click', resetGame);
+  window.addEventListener('resize', updateWorldBounds, { passive:true });
+
+  // ===== Loop =====
+  let last = performance.now();
+  function tick(now){
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+
+    if (!isGameOver){
+      player.vy += GRAVITY * dt;
+      player.vx *= AIR_DAMP;
+      player.vy *= AIR_DAMP;
+
+      resolve(dt);
+
+      if (player.y < bestY) bestY = player.y;
+
+      const H = canvas.clientHeight;
+      const target = player.y - H * 0.40;
+      cam.y = Math.min(cam.y, target);
+
+      generatePlatformsUpTo(cam.y - H * 1.8);
+      cleanupPlatforms(H);
+
+      checkGameOver();
+    }
+
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  function render(){
+    const W = canvas.clientWidth;
+    const H = canvas.clientHeight;
+
+    ctx.fillStyle = '#0b0f19';
+    ctx.fillRect(0,0,W,H);
+
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = '#2a3a6a';
+    for (let i=0;i<70;i++){
+      const x = (i*97) % W;
+      const y = (i*173) % H;
+      ctx.fillRect(x, y, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // playfield boundaries
+    ctx.fillStyle = 'rgba(2, 6, 14, 0.45)';
+    if (WORLD_MIN_X > 0) ctx.fillRect(0, 0, WORLD_MIN_X, H);
+    if (WORLD_MAX_X < W) ctx.fillRect(WORLD_MAX_X, 0, W - WORLD_MAX_X, H);
+
+    for (const pl of platforms){
+      const sy = pl.y - cam.y;
+      if (sy > H + 80 || sy + pl.h < -80) continue;
+
+      ctx.fillStyle = '#1a2550';
+      ctx.fillRect(pl.x, sy, pl.w, pl.h);
+
+      ctx.strokeStyle = '#2f46a8';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(pl.x + 0.5, sy + 0.5, pl.w - 1, pl.h - 1);
+    }
+
+    const idleBob = isIdleAnimating()
+      ? Math.sin(performance.now() * IDLE_BOB_SPEED) * IDLE_BOB_AMPLITUDE
+      : 0;
+    const py = player.y - cam.y + idleBob;
+    drawPixelSprite(PLAYER_SPRITE_KIND, player.x, py, playerFacing);
+
+    if (input.aiming){
+      const sx = input.startX;
+      const sy = input.startY;
+
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = '#6aa2ff';
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + input.pullX, sy + input.pullY);
+      ctx.stroke();
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#9ad1ff';
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx - input.pullX, sy - input.pullY);
+      ctx.stroke();
+
+      const power = clamp(Math.hypot(input.pullX, input.pullY) / MAX_PULL, 0, 1);
+      ctx.fillStyle = '#6aa2ff';
+      ctx.fillRect(12, 44, 140 * power, 8);
+      ctx.strokeStyle = '#2f46a8';
+      ctx.strokeRect(12.5, 44.5, 140, 8);
+    }
+
+    const t = elapsedSec();
+    const mm = String(Math.floor(t/60)).padStart(2,'0');
+    const ss = String(t%60).padStart(2,'0');
+
+    hud.textContent =
+`SCORE  ${score()}
+TIME   ${mm}:${ss}
+STATE  ${isGameOver ? 'GAME OVER' : (isFullyStopped() ? 'READY' : (player.onGround ? 'GROUND' : 'AIR'))}
+POS    (${player.x.toFixed(0)}, ${player.y.toFixed(0)})`;
+  }
+
+  updateWorldBounds();
+  seedBasePlatforms();
+  loadFixedSprite();
+  generatePlatformsUpTo(player.y - canvas.clientHeight * 2.2);
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
