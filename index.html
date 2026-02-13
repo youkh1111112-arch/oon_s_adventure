@@ -290,9 +290,9 @@
   const MAIN_ROUTE_DEBUG = false;
   const MAIN_DY_DEBUG = false;
   const FORCE_MOBILE_VIEW = true;
-  const MOBILE_MAIN_MIN_DY_HARD = 130;
+  const MOBILE_MAIN_MIN_DY_HARD = 88;
   const MOBILE_MAIN_REROLL_MAX = 20;
-  const MOBILE_MAIN_MAX_DY_SAFE = 182;
+  const MOBILE_MAIN_MAX_DY_SAFE = 150;
   const MOBILE_MAIN_MIN_SHIFT_HARD = 96;
   const DESKTOP_MAIN_MIN_SHIFT_HARD = 72;
   const MOBILE_MAIN_MIN_EDGE_GAP = 30;
@@ -621,16 +621,16 @@
       const baseMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
       const baseMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), baseMinDy + 16, MAIN_MAX_DY);
       const safeTop = REACH_MAX_DY - 8;
-      const mobileScaledMin = clamp(baseMinDy * 1.45, MOBILE_MAIN_MIN_DY_HARD, safeTop - 14);
-      const mobileScaledMax = clamp(baseMaxDy * 1.75, mobileScaledMin + 10, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE));
+      const mobileScaledMin = clamp(baseMinDy * 1.18, MOBILE_MAIN_MIN_DY_HARD, safeTop - 20);
+      const mobileScaledMax = clamp(baseMaxDy * 1.35, mobileScaledMin + 10, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE));
       const recent3 = mainDyRecent.mobile.slice(-3);
       const smallCount = recent3.filter((v) => v < 150).length;
       const forceLargeDy = isMobile && smallCount >= 2;
       const dyMin = isMobile
-        ? (forceLargeDy ? clamp(160, MOBILE_MAIN_MIN_DY_HARD, Math.min(safeTop - 8, MOBILE_MAIN_MAX_DY_SAFE - 14)) : mobileScaledMin)
+        ? (forceLargeDy ? clamp(124, MOBILE_MAIN_MIN_DY_HARD, Math.min(safeTop - 10, MOBILE_MAIN_MAX_DY_SAFE - 10)) : mobileScaledMin)
         : baseMinDy;
       const dyMax = isMobile
-        ? (forceLargeDy ? clamp(184, dyMin + 4, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE)) : mobileScaledMax)
+        ? (forceLargeDy ? clamp(150, dyMin + 4, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE)) : mobileScaledMax)
         : baseMaxDy;
 
       let main = null;
@@ -663,7 +663,7 @@
       }
 
       if (!main){
-        // Hard correction: force at least dy 130 on mobile.
+        // Hard correction: keep mobile dy at or above minimum reachable threshold.
         const forcedDy = isMobile ? MOBILE_MAIN_MIN_DY_HARD : baseMinDy;
         nextPlatformY = anchorY - forcedDy;
         main = spawnMainPlatform(nextPlatformY, {
