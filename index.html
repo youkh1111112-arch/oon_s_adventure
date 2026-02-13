@@ -286,7 +286,7 @@
   const MAIN_MIN_DY = 90;
   const MAIN_MAX_DY = 160;
   const MAIN_MIN_SHIFT = 64;
-  const MAIN_ROUTE_RETRY = 28;
+  const MAIN_ROUTE_RETRY = 36;
   const MAIN_ROUTE_DEBUG = false;
   const MAIN_DY_DEBUG = false;
   const FORCE_MOBILE_VIEW = true;
@@ -297,12 +297,12 @@
   const DESKTOP_MAIN_MIN_SHIFT_HARD = 72;
   const MOBILE_MAIN_MIN_EDGE_GAP = 30;
   const DESKTOP_MAIN_MIN_EDGE_GAP = 18;
-  const MOBILE_MAIN_MAX_W_SCREEN_RATIO = 0.56;
-  const DESKTOP_MAIN_MAX_W_SCREEN_RATIO = 0.62;
-  const MOBILE_SUB_MAX_W_SCREEN_RATIO = 0.52;
-  const DESKTOP_SUB_MAX_W_SCREEN_RATIO = 0.58;
-  const RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.52;
-  const MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.50;
+  const MOBILE_MAIN_MAX_W_SCREEN_RATIO = 0.42;
+  const DESKTOP_MAIN_MAX_W_SCREEN_RATIO = 0.55;
+  const MOBILE_SUB_MAX_W_SCREEN_RATIO = 0.42;
+  const DESKTOP_SUB_MAX_W_SCREEN_RATIO = 0.55;
+  const RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.55;
+  const MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO = 0.42;
   const SMALL_ANCHOR_W = 132;
   const SMALL_ANCHOR_NEARBY_Y_BAND = 66;
   const SMALL_ANCHOR_WIDE_BLOCK_RATIO = 0.44;
@@ -318,8 +318,51 @@
   const CEILING_TRAP_MIN_FREE_W = 70;
   const CEILING_TRAP_NEAR_ANCHOR = 120;
   const CEILING_TRAP_REROLL_MAX = 30;
+  const PATH_VALIDATE_STEPS = 4;
+  const PATH_VALIDATE_MIN_GAIN_Y = 180;
+  const PATH_VALIDATE_REROLL_MAX = 40;
+  const Y_BAND_FREE_MIN_W = 90;
+  const Y_BAND_HALF_RANGE = 35;
+  const MAIN_DY_DESKTOP_MIN = 110;
+  const MAIN_DY_DESKTOP_MAX = 160;
+  const MAIN_DY_MOBILE_MIN = 140;
+  const MAIN_DY_MOBILE_MAX = 200;
+  const MAIN_DX_DESKTOP_MIN = 90;
+  const MAIN_DX_MOBILE_MIN = 110;
+  const MAIN_CENTER_BIAS_WINDOW = 8;
+  const MAIN_CENTER_DRIFT_LIMIT = 0.20;
+  const MAIN_QUALITY_MIN_SCORE = 2.5;
+  const MAIN_BLOCKED_RATIO_LIMIT = 0.60;
+  const MAIN_MAX_W_DESKTOP_PX = 220;
+  const MAIN_MAX_W_MOBILE_PX = 180;
+  const MAIN_MAX_W_DESKTOP_RATIO = 0.45;
+  const MAIN_MAX_W_MOBILE_RATIO = 0.38;
+  const SUB_W_MIN = 70;
+  const SUB_W_MAX = 130;
+  const STACK_DY_DESKTOP = 140;
+  const STACK_DY_MOBILE = 180;
+  const STACK_OVERLAP_RATIO_DESKTOP = 0.10;
+  const STACK_OVERLAP_RATIO_MOBILE = 0.10;
+  const STACK_CENTER_GAP_DESKTOP = 90;
+  const STACK_CENTER_GAP_MOBILE = 110;
+  const VIEW_DY_DESKTOP_RATIO = 1.2;
+  const VIEW_DY_MOBILE_RATIO = 1.6;
+  const DY_SOFT_DESKTOP = 220;
+  const DY_SOFT_MOBILE = 280;
+  const MIN_GAP_X_DESKTOP = 32;
+  const MIN_GAP_X_MOBILE = 50;
+  const Y_BUCKET_SIZE = 200;
+  const DEBUG_OVERLAP = false;
+  const VISUAL_PAD_X_DESKTOP = 8;
+  const VISUAL_PAD_X_MOBILE = 12;
+  const VISUAL_PAD_Y_DESKTOP = 6;
+  const VISUAL_PAD_Y_MOBILE = 10;
   const mainRouteRecent = [];
   const mainDyRecent = { mobile: [], desktop: [] };
+  const mainCenterRecent = [];
+  const platformYBuckets = new Map();
+  let nextPlatformId = 1;
+  let lastOverlapScanAt = 0;
 
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
   function rand(min, max){ return min + Math.random() * (max - min); }
@@ -345,10 +388,9 @@
     const baseX = worldCenterX() - baseW * 0.5;
 
     platforms.length = 0;
-    platforms.push(
-      { x: baseX, y: 640, w: baseW, h: 50, keep: true, crumble: false, standTime: 0, broken: false },
-      { x: startX, y: 560, w: startW, h: 16, keep: true, crumble: false, standTime: 0, broken: false }
-    );
+    clearPlatformBuckets();
+    addPlatform({ x: baseX, y: 640, w: baseW, h: 50, keep: true, crumble: false, standTime: 0, broken: false });
+    addPlatform({ x: startX, y: 560, w: startW, h: 16, keep: true, crumble: false, standTime: 0, broken: false });
 
     nextPlatformY = 560;
     lastPlatformX = startX;
@@ -356,6 +398,10 @@
     lastMainSide = 0;
     lastMainPlatform = makePlatform(startX, 560, startW, 16, { keep: true });
     earlyPreferredSide = Math.random() < 0.5 ? -1 : 1;
+    mainRouteRecent.length = 0;
+    mainDyRecent.mobile.length = 0;
+    mainDyRecent.desktop.length = 0;
+    mainCenterRecent.length = 0;
     player.x = startX + (startW - player.w) * 0.5;
     player.y = SPAWN_Y;
   }
@@ -375,6 +421,45 @@
       broken: false,
       item: null
     };
+  }
+
+  function bucketKeyForY(y){
+    return Math.floor(y / Y_BUCKET_SIZE);
+  }
+
+  function clearPlatformBuckets(){
+    platformYBuckets.clear();
+  }
+
+  function addPlatformToBuckets(pl){
+    if (!pl || pl.broken) return;
+    const key = bucketKeyForY(pl.y);
+    let bin = platformYBuckets.get(key);
+    if (!bin){
+      bin = new Set();
+      platformYBuckets.set(key, bin);
+    }
+    bin.add(pl);
+  }
+
+  function removePlatformFromBuckets(pl){
+    if (!pl) return;
+    const key = bucketKeyForY(pl.y);
+    const bin = platformYBuckets.get(key);
+    if (!bin) return;
+    bin.delete(pl);
+    if (bin.size === 0) platformYBuckets.delete(key);
+  }
+
+  function rebuildPlatformBuckets(){
+    clearPlatformBuckets();
+    for (const pl of platforms) addPlatformToBuckets(pl);
+  }
+
+  function addPlatform(pl){
+    if (pl && pl._id == null) pl._id = nextPlatformId++;
+    platforms.push(pl);
+    addPlatformToBuckets(pl);
   }
 
   function horizontalGapBetween(from, to){
@@ -421,6 +506,147 @@
         candidate.y + candidate.h > pl.y - padding
       ) return true;
     }
+    return false;
+  }
+
+  function getVisualPad(isMobile){
+    return {
+      x: isMobile ? VISUAL_PAD_X_MOBILE : VISUAL_PAD_X_DESKTOP,
+      y: isMobile ? VISUAL_PAD_Y_MOBILE : VISUAL_PAD_Y_DESKTOP
+    };
+  }
+
+  function getWorldRect(pl, isMobile){
+    const pad = getVisualPad(isMobile);
+    return {
+      left: pl.x - pad.x,
+      right: pl.x + pl.w + pad.x,
+      top: pl.y - pad.y,
+      bottom: pl.y + pl.h + pad.y
+    };
+  }
+
+  function getScreenRectFromWorldRect(rect){
+    const camX = cam.x || 0;
+    return {
+      left: rect.left - camX,
+      right: rect.right - camX,
+      top: rect.top - cam.y,
+      bottom: rect.bottom - cam.y
+    };
+  }
+
+  function getNearbyPlatformsForCandidate(candidate, rangeY, extraPlatforms = []){
+    const bucketRadius = Math.ceil(rangeY / Y_BUCKET_SIZE) + 1;
+    const key = bucketKeyForY(candidate.y);
+    const out = [];
+    for (let k = key - bucketRadius; k <= key + bucketRadius; k++){
+      const bin = platformYBuckets.get(k);
+      if (!bin) continue;
+      for (const pl of bin) out.push(pl);
+    }
+    for (const pl of extraPlatforms){
+      if (!pl) continue;
+      if (!out.includes(pl)) out.push(pl);
+    }
+    return out;
+  }
+
+  function overlapWidth1D(a0, a1, b0, b1){
+    return Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+  }
+
+  function isCenterClusterStack(candidate, isMobile, extraPlatforms = []){
+    const H = viewportH || Math.round(window.innerHeight);
+    const yTop = cam.y;
+    const yBottom = cam.y + H * 1.2;
+    if (candidate.y < yTop || candidate.y > yBottom) return false;
+    const centerGap = isMobile ? STACK_CENTER_GAP_MOBILE : STACK_CENTER_GAP_DESKTOP;
+    const ccx = candidate.x + candidate.w * 0.5;
+    let nearCount = 0;
+    const sources = platforms.concat(extraPlatforms);
+    for (const pl of sources){
+      if (!pl || pl.broken || pl === candidate) continue;
+      if (pl.y < yTop || pl.y > yBottom) continue;
+      const pcx = pl.x + pl.w * 0.5;
+      if (Math.abs(ccx - pcx) < centerGap) nearCount += 1;
+      if (nearCount >= 2) return true; // with candidate => 3+
+    }
+    return false;
+  }
+
+  function isStacking(candidate, isMobile, extraPlatforms = []){
+    const stackDy = isMobile ? STACK_DY_MOBILE : STACK_DY_DESKTOP;
+    const overlapRatioLimit = isMobile ? STACK_OVERLAP_RATIO_MOBILE : STACK_OVERLAP_RATIO_DESKTOP;
+    const sources = getNearbyPlatformsForCandidate(candidate, stackDy, extraPlatforms);
+    const cLeft = candidate.x;
+    const cRight = candidate.x + candidate.w;
+    for (const pl of sources){
+      if (!pl || pl.broken || pl === candidate) continue;
+      if (Math.abs(candidate.y - pl.y) >= stackDy) continue; // local range only for perf
+      const pLeft = pl.x;
+      const pRight = pl.x + pl.w;
+      const overlapW = overlapWidth1D(cLeft, cRight, pLeft, pRight);
+      if (overlapW <= 0) continue;
+      const denom = Math.max(1, Math.min(candidate.w, pl.w));
+      const overlapRatio = overlapW / denom;
+      if (overlapRatio > overlapRatioLimit) return true;
+    }
+    return isCenterClusterStack(candidate, isMobile, extraPlatforms);
+  }
+
+  function isVisualOverlapRejected(candidate, isMobile, extraPlatforms = [], debugLabel = ''){
+    const H = viewportH || Math.round(window.innerHeight);
+    const viewDy = (isMobile ? VIEW_DY_MOBILE_RATIO : VIEW_DY_DESKTOP_RATIO) * H;
+    const dySoft = isMobile ? DY_SOFT_MOBILE : DY_SOFT_DESKTOP;
+    const minGapX = isMobile ? MIN_GAP_X_MOBILE : MIN_GAP_X_DESKTOP;
+    const stackDy = isMobile ? STACK_DY_MOBILE : STACK_DY_DESKTOP;
+    const nearby = getNearbyPlatformsForCandidate(candidate, viewDy, extraPlatforms);
+    const cWorld = getWorldRect(candidate, isMobile);
+    const cScreen = getScreenRectFromWorldRect(cWorld);
+    const cW = Math.max(1, cWorld.right - cWorld.left);
+
+    for (const pl of nearby){
+      if (!pl || pl.broken || pl === candidate) continue;
+      const dy = Math.abs(candidate.y - pl.y);
+      if (dy > viewDy) continue;
+
+      const pWorld = getWorldRect(pl, isMobile);
+      const pScreen = getScreenRectFromWorldRect(pWorld);
+      const xOverlapPx = overlapWidth1D(cScreen.left, cScreen.right, pScreen.left, pScreen.right);
+      const xGap = Math.max(pScreen.left - cScreen.right, cScreen.left - pScreen.right);
+      const pW = Math.max(1, pWorld.right - pWorld.left);
+      const overlapRatio = xOverlapPx / Math.max(1, Math.min(cW, pW));
+
+      if (xOverlapPx > 0 && dy < dySoft){
+        if (DEBUG_OVERLAP){
+          console.log(
+            `reject: overlap tag=${debugLabel} dx=${Math.round(xOverlapPx)} dy=${Math.round(dy)} ratio=${overlapRatio.toFixed(2)} ` +
+            `candW=${JSON.stringify(cWorld)} plW=${JSON.stringify(pWorld)} candS=${JSON.stringify(cScreen)} plS=${JSON.stringify(pScreen)}`
+          );
+        }
+        return true;
+      }
+      if (dy < dySoft && xGap < minGapX){
+        if (DEBUG_OVERLAP){
+          console.log(`reject: min-gap tag=${debugLabel} gap=${Math.round(xGap)} dy=${Math.round(dy)} need=${minGapX}`);
+        }
+        return true;
+      }
+      if (dy < stackDy && overlapRatio >= 0.10){
+        if (DEBUG_OVERLAP){
+          console.log(`reject: stack-ratio tag=${debugLabel} ratio=${overlapRatio.toFixed(2)} dy=${Math.round(dy)}`);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function shouldRejectCandidate(candidate, isMobile, extraPlatforms = [], debugLabel = ''){
+    if (overlapsAnyPlatform(candidate, 8)) return true;
+    if (isStacking(candidate, isMobile, extraPlatforms)) return true;
+    if (isVisualOverlapRejected(candidate, isMobile, extraPlatforms, debugLabel)) return true;
     return false;
   }
 
@@ -472,6 +698,41 @@
     return false;
   }
 
+  function getRandomPlatformMaxWidth(isMobile){
+    const playW = WORLD_MAX_X - WORLD_MIN_X;
+    if (isMobile) return Math.min(MAIN_MAX_W_MOBILE_PX, playW * MAIN_MAX_W_MOBILE_RATIO);
+    return Math.min(MAIN_MAX_W_DESKTOP_PX, playW * MAIN_MAX_W_DESKTOP_RATIO);
+  }
+
+  function getCenterBiasSide(){
+    if (mainCenterRecent.length < 4) return 0;
+    const center = worldCenterX();
+    const playHalf = Math.max(1, (WORLD_MAX_X - WORLD_MIN_X) * 0.5);
+    const recent = mainCenterRecent.slice(-MAIN_CENTER_BIAS_WINDOW);
+    const avg = recent.reduce((a, b) => a + b, 0) / Math.max(1, recent.length);
+    const drift = (avg - center) / playHalf;
+    if (drift > MAIN_CENTER_DRIFT_LIMIT) return -1;
+    if (drift < -MAIN_CENTER_DRIFT_LIMIT) return 1;
+    return 0;
+  }
+
+  function blockedRatioInYBand(y, band = Y_BAND_HALF_RANGE, extraPlatforms = []){
+    const intervals = [];
+    const sources = platforms.concat(extraPlatforms);
+    for (const pl of sources){
+      if (!pl || pl.broken) continue;
+      if (Math.abs(pl.y - y) > band) continue;
+      const l = Math.max(WORLD_MIN_X, pl.x);
+      const r = Math.min(WORLD_MAX_X, pl.x + pl.w);
+      if (r > l) intervals.push([l, r]);
+    }
+    const merged = mergeIntervals(intervals);
+    const playW = Math.max(1, WORLD_MAX_X - WORLD_MIN_X);
+    let blockedLen = 0;
+    for (const [l, r] of merged) blockedLen += (r - l);
+    return blockedLen / playW;
+  }
+
   function mergeIntervals(intervals){
     if (intervals.length === 0) return [];
     intervals.sort((a, b) => a[0] - b[0]);
@@ -486,6 +747,26 @@
       }
     }
     return merged;
+  }
+
+  function hasWideFreeIntervalInYBand(y, band = Y_BAND_HALF_RANGE, minFreeW = Y_BAND_FREE_MIN_W, extraPlatforms = []){
+    const intervals = [];
+    const sources = platforms.concat(extraPlatforms);
+    for (const pl of sources){
+      if (!pl || pl.broken) continue;
+      if (Math.abs(pl.y - y) > band) continue;
+      const l = Math.max(WORLD_MIN_X, pl.x);
+      const r = Math.min(WORLD_MAX_X, pl.x + pl.w);
+      if (r <= l) continue;
+      intervals.push([l, r]);
+    }
+    const blocked = mergeIntervals(intervals);
+    let cursor = WORLD_MIN_X;
+    for (const [l, r] of blocked){
+      if (l - cursor >= minFreeW) return true;
+      cursor = Math.max(cursor, r);
+    }
+    return (WORLD_MAX_X - cursor) >= minFreeW;
   }
 
   function getCeilingTrapAnalysis(anchor, extraPlatforms = [], isMobile = false){
@@ -557,7 +838,7 @@
       const x = clamp(cx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
       const y = anchor.y - baseDy;
       const rescue = makePlatform(x, y, w, 14);
-      if (overlapsAnyPlatform(rescue, 8)) continue;
+      if (shouldRejectCandidate(rescue, isMobile, [], 'rescue-main')) continue;
       if (!isReachableFrom(anchor, rescue, difficulty)) continue;
       return rescue;
     }
@@ -593,6 +874,126 @@
     return false;
   }
 
+  function getReachableSideChoices(anchor, difficulty, extraPlatforms = [], windowMul = 1.2){
+    if (!anchor) return { left: false, right: false, hasBoth: false };
+    const H = viewportH || Math.round(window.innerHeight);
+    const topY = cam.y - H * windowMul;
+    const bottomY = cam.y + H * 0.1;
+    const nodes = getPathValidationNodes(anchor, extraPlatforms);
+    let left = false;
+    let right = false;
+    const anchorCx = anchor.x + anchor.w * 0.5;
+    for (const pl of nodes){
+      if (pl === anchor) continue;
+      if (pl.y < topY || pl.y > bottomY) continue;
+      if (pl.y >= anchor.y) continue;
+      if (!isReachableFrom(anchor, pl, difficulty)) continue;
+      if (routeBlockedByAnyPlatform(anchor, pl, new Set([anchor]))) continue;
+      const cx = pl.x + pl.w * 0.5;
+      if (cx < anchorCx - 8) left = true;
+      if (cx > anchorCx + 8) right = true;
+      if (left && right) break;
+    }
+    return { left, right, hasBoth: left && right };
+  }
+
+  function evaluateMainRouteQuality(anchor, candidate, difficulty, isMobile){
+    const center = worldCenterX();
+    const playHalf = Math.max(1, (WORLD_MAX_X - WORLD_MIN_X) * 0.5);
+    const candidateCx = candidate.x + candidate.w * 0.5;
+    const simulatedCenters = mainCenterRecent.slice(-(MAIN_CENTER_BIAS_WINDOW - 1));
+    simulatedCenters.push(candidateCx);
+    const avgCx = simulatedCenters.reduce((a, b) => a + b, 0) / Math.max(1, simulatedCenters.length);
+    const driftNorm = Math.abs(avgCx - center) / playHalf;
+    const balanceScore = clamp(1 - driftNorm / MAIN_CENTER_DRIFT_LIMIT, 0, 1);
+
+    const side = anchor ? ((candidateCx >= (anchor.x + anchor.w * 0.5)) ? 1 : -1) : 0;
+    const zigzagScore = (lastMainSide === 0 || side === -lastMainSide) ? 1 : 0;
+    const blockScore = blockedRatioInYBand(candidate.y, Y_BAND_HALF_RANGE, [candidate]) <= MAIN_BLOCKED_RATIO_LIMIT ? 1 : 0;
+    const choices = getReachableSideChoices(anchor, difficulty, [candidate], 1.2);
+    const choiceScore = choices.hasBoth ? 1 : 0;
+
+    return {
+      total: balanceScore + zigzagScore + blockScore + choiceScore,
+      hasBothChoices: choices.hasBoth,
+      side
+    };
+  }
+
+  function buildRescuePlatformOnSide(anchor, difficulty, isMobile, forcedSide){
+    const playW = WORLD_MAX_X - WORLD_MIN_X;
+    const w = clamp(playW * (isMobile ? 0.20 : 0.16), SUB_W_MIN, Math.min(112, getRandomPlatformMaxWidth(isMobile)));
+    const dyMin = isMobile ? MAIN_DY_MOBILE_MIN : MAIN_DY_DESKTOP_MIN;
+    const dyMax = isMobile ? Math.min(MAIN_DY_MOBILE_MAX, REACH_MAX_DY - 8) : MAIN_DY_DESKTOP_MAX;
+    const dy = rand(dyMin, dyMax);
+    const maxDx = Math.max((isMobile ? MAIN_DX_MOBILE_MIN : MAIN_DX_DESKTOP_MIN) + 8, getReachMaxDx(dy, difficulty) - 20);
+    const minDx = clamp(isMobile ? MAIN_DX_MOBILE_MIN : MAIN_DX_DESKTOP_MIN, 36, maxDx - 6);
+    const anchorCx = anchor.x + anchor.w * 0.5;
+    const side = forcedSide < 0 ? -1 : 1;
+    for (let i = 0; i < 28; i++){
+      const dx = rand(minDx, maxDx);
+      const cx = anchorCx + side * dx;
+      const x = clamp(cx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
+      const y = anchor.y - dy + rand(-10, 10);
+      const rescue = makePlatform(x, y, w, 14);
+      if (shouldRejectCandidate(rescue, isMobile, [], 'rescue-side')) continue;
+      if (!isReachableFrom(anchor, rescue, difficulty)) continue;
+      if (routeBlockedByAnyPlatform(anchor, rescue, new Set([anchor]))) continue;
+      return rescue;
+    }
+    return null;
+  }
+
+  function getPathValidationNodes(anchor, extraPlatforms = []){
+    const H = viewportH || Math.round(window.innerHeight);
+    const yMin = cam.y - H * 1.8;
+    const yMax = cam.y + H * 0.8;
+    const nodes = [];
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (pl.y < yMin || pl.y > yMax) continue;
+      nodes.push(pl);
+    }
+    for (const pl of extraPlatforms){
+      if (!pl || pl.broken) continue;
+      if (!nodes.includes(pl)) nodes.push(pl);
+    }
+    if (anchor && !nodes.includes(anchor)) nodes.push(anchor);
+    return nodes;
+  }
+
+  function existsPathUp(anchor, difficulty, opts = {}){
+    if (!anchor) return true;
+    const maxSteps = typeof opts.steps === 'number' ? opts.steps : PATH_VALIDATE_STEPS;
+    const minGainY = typeof opts.minGainY === 'number' ? opts.minGainY : PATH_VALIDATE_MIN_GAIN_Y;
+    const extraPlatforms = Array.isArray(opts.extraPlatforms) ? opts.extraPlatforms : [];
+    const ignoreSet = opts.ignoreSet || null;
+    const nodes = getPathValidationNodes(anchor, extraPlatforms);
+    if (nodes.length <= 1) return false;
+
+    const queue = [{ node: anchor, step: 0 }];
+    const bestStep = new Map([[anchor, 0]]);
+    while (queue.length){
+      const cur = queue.shift();
+      const gainY = anchor.y - cur.node.y;
+      if (cur.step > 0 && gainY >= minGainY) return true;
+      if (cur.step >= maxSteps) continue;
+
+      for (const next of nodes){
+        if (next === cur.node) continue;
+        if (next.y >= cur.node.y) continue;
+        if (!isReachableFrom(cur.node, next, difficulty)) continue;
+        if (routeBlockedByAnyPlatform(cur.node, next, ignoreSet)) continue;
+        const nextStep = cur.step + 1;
+        const prevBest = bestStep.get(next);
+        if (prevBest !== undefined && prevBest <= nextStep) continue;
+        bestStep.set(next, nextStep);
+        queue.push({ node: next, step: nextStep });
+      }
+    }
+    return false;
+  }
+
   function snapshotMainGenState(){
     return {
       lastPlatformX,
@@ -601,7 +1002,8 @@
       lastMainPlatform: lastMainPlatform ? { ...lastMainPlatform } : null,
       routeLen: mainRouteRecent.length,
       mobileDyLen: mainDyRecent.mobile.length,
-      desktopDyLen: mainDyRecent.desktop.length
+      desktopDyLen: mainDyRecent.desktop.length,
+      centerLen: mainCenterRecent.length
     };
   }
 
@@ -613,6 +1015,7 @@
     mainRouteRecent.length = snapshot.routeLen;
     mainDyRecent.mobile.length = snapshot.mobileDyLen;
     mainDyRecent.desktop.length = snapshot.desktopDyLen;
+    mainCenterRecent.length = snapshot.centerLen;
   }
 
   function spawnMainPlatform(y, opts = {}){
@@ -634,20 +1037,9 @@
       w = Math.min(w, playW * 0.38);
     }
     {
-      const playW = WORLD_MAX_X - WORLD_MIN_X;
-      const climbRatio = clamp(climb / 3600, 0, 1);
-      if (isMobile){
-        w = clamp(w * rand(1.10, 1.22), 86, Math.max(132, playW * 0.52));
-      }
-      const screenCapRatio = isMobile ? MOBILE_MAIN_MAX_W_SCREEN_RATIO : DESKTOP_MAIN_MAX_W_SCREEN_RATIO;
-      const hardCap = playW * lerp(screenCapRatio, screenCapRatio - 0.14, climbRatio);
-      const randomCap = isMobile
-        ? playW * MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO
-        : playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO;
-      w = Math.min(w, hardCap, randomCap);
-      if (isSmallSingleAnchor(anchor)){
-        w = Math.min(w, playW * SMALL_ANCHOR_WIDE_BLOCK_RATIO);
-      }
+      const hardMaxW = getRandomPlatformMaxWidth(isMobile);
+      w = clamp(w, 72, hardMaxW);
+      if (isSmallSingleAnchor(anchor)) w = Math.min(w, hardMaxW * 0.9);
     }
 
     // 초기 anchor가 없는 경우(이론상 거의 없음) 대비
@@ -663,14 +1055,15 @@
 
     const upwardDy = clamp(anchor.y - y, tuneMinDy, tuneMaxDy);
     const anchorCx = anchor.x + anchor.w * 0.5;
+    const minDxHard = isMobile ? MAIN_DX_MOBILE_MIN : MAIN_DX_DESKTOP_MIN;
     const maxDxRaw = getReachMaxDx(upwardDy, difficulty);
-    const maxDx = Math.max(MAIN_MIN_SHIFT + 8, maxDxRaw - 8);
-    const routeMinShiftWanted = isMobile ? MOBILE_MAIN_MIN_SHIFT_HARD : DESKTOP_MAIN_MIN_SHIFT_HARD;
-    const routeMinShift = clamp(routeMinShiftWanted, 28, Math.max(30, maxDx - 10));
+    const maxDx = Math.max(minDxHard + 8, maxDxRaw - 20);
+    const routeMinShift = clamp(minDxHard, 28, Math.max(30, maxDx - 10));
     const routeMinEdgeGap = isMobile ? MOBILE_MAIN_MIN_EDGE_GAP : DESKTOP_MAIN_MIN_EDGE_GAP;
-    const minDxBase = getPreferredMinDx(upwardDy, difficulty);
-    const minDx = clamp(Math.max(routeMinShift, minDxBase), routeMinShift, Math.max(routeMinShift + 6, maxDx - 8));
-    const preferredSide = lastMainSide === 0 ? (Math.random() < 0.5 ? -1 : 1) : -lastMainSide;
+    const minDx = clamp(routeMinShift, routeMinShift, Math.max(routeMinShift + 6, maxDx - 8));
+    const centerBiasSide = getCenterBiasSide();
+    let preferredSide = lastMainSide === 0 ? (Math.random() < 0.5 ? -1 : 1) : -lastMainSide;
+    if (centerBiasSide !== 0) preferredSide = centerBiasSide;
     const sides = [preferredSide, -preferredSide];
 
     let candidate = null;
@@ -687,7 +1080,8 @@
       if (shift < routeMinShift) continue;
       if (edgeGap < routeMinEdgeGap) continue;
       if (isBlockingCeiling(anchor, c)) continue;
-      if (overlapsAnyPlatform(c, 8)) continue;
+      if (!hasWideFreeIntervalInYBand(c.y, Y_BAND_HALF_RANGE, Y_BAND_FREE_MIN_W, [c])) continue;
+      if (shouldRejectCandidate(c, isMobile, [], 'main-primary')) continue;
       if (!isReachableFrom(anchor, c, difficulty)) continue;
       if (routeBlockedByAnyPlatform(anchor, c, new Set([anchor]))) continue;
       candidate = c;
@@ -711,7 +1105,8 @@
           if (shift < Math.max(34, routeMinShift * 0.72)) continue;
           if (edgeGap < Math.max(14, routeMinEdgeGap * 0.66)) continue;
           if (isBlockingCeiling(anchor, c)) continue;
-          if (overlapsAnyPlatform(c, 8)) continue;
+          if (!hasWideFreeIntervalInYBand(c.y, Y_BAND_HALF_RANGE, Y_BAND_FREE_MIN_W, [c])) continue;
+          if (shouldRejectCandidate(c, isMobile, [], 'main-relax')) continue;
           if (!isReachableFrom(anchor, c, difficulty)) continue;
           if (routeBlockedByAnyPlatform(anchor, c, new Set([anchor]))) continue;
           candidate = c;
@@ -732,17 +1127,17 @@
       candidate = makePlatform(nx, py, w, 16);
       chosenSide = side;
       // 혹시 충돌이면 반대편으로 스왑
-      if (overlapsAnyPlatform(candidate, 8) || !isReachableFrom(anchor, candidate, difficulty)){
+      if (shouldRejectCandidate(candidate, isMobile, [], 'main-safe') || !isReachableFrom(anchor, candidate, difficulty)){
         const nx2 = clamp(anchorCx - side * safeDx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
         const c2 = makePlatform(nx2, py, w, 16);
-        if (!overlapsAnyPlatform(c2, 8) && isReachableFrom(anchor, c2, difficulty)){
+        if (!shouldRejectCandidate(c2, isMobile, [], 'main-safe-swap') && isReachableFrom(anchor, c2, difficulty)){
           candidate = c2;
           chosenSide = -side;
         }
       }
     }
 
-    if (!candidate || overlapsAnyPlatform(candidate, 8) || !isReachableFrom(anchor, candidate, difficulty)){
+    if (!candidate || shouldRejectCandidate(candidate, isMobile, [], 'main-forced-check') || !isReachableFrom(anchor, candidate, difficulty)){
       let forced = null;
       for (let dyTry = Math.max(108, tuneMinDy); dyTry >= tuneMinDy && !forced; dyTry -= 6){
         const py = anchor.y - dyTry;
@@ -754,7 +1149,8 @@
             const c = makePlatform(nx, py, w, 16);
             const edgeGap = horizontalGapBetween(anchor, c);
             if (edgeGap < Math.max(10, routeMinEdgeGap * 0.5)) continue;
-            if (overlapsAnyPlatform(c, 8)) continue;
+            if (!hasWideFreeIntervalInYBand(c.y, Y_BAND_HALF_RANGE, Y_BAND_FREE_MIN_W, [c])) continue;
+            if (shouldRejectCandidate(c, isMobile, [], 'main-forced')) continue;
             if (!isReachableFrom(anchor, c, difficulty)) continue;
             forced = c;
             chosenSide = side;
@@ -767,6 +1163,25 @@
     }
 
     if (!candidate){
+      const playW = WORLD_MAX_X - WORLD_MIN_X;
+      const laneXs = [
+        WORLD_MIN_X + playW * 0.22,
+        WORLD_MIN_X + playW * 0.50,
+        WORLD_MIN_X + playW * 0.78
+      ];
+      for (let i = 0; i < 24 && !candidate; i++){
+        const lane = laneXs[Math.floor(Math.random() * laneXs.length)];
+        const py = anchor.y - clamp(rand(tuneMinDy, tuneMaxDy), tuneMinDy, Math.min(tuneMaxDy, REACH_MAX_DY - 6));
+        const nx = clamp(lane - w * 0.5 + rand(-18, 18), spawnMinX() + 2, spawnMaxX(w) - 2);
+        const forcedLane = makePlatform(nx, py, w, 16);
+        if (shouldRejectCandidate(forcedLane, isMobile, [], 'main-lane')) continue;
+        if (!isReachableFrom(anchor, forcedLane, difficulty)) continue;
+        candidate = forcedLane;
+        chosenSide = ((forcedLane.x + forcedLane.w * 0.5) >= anchorCx) ? 1 : -1;
+      }
+    }
+
+    if (!candidate){
       const py = anchor.y - tuneMinDy;
       const nx = clamp(anchorCx - w * 0.5, spawnMinX() + 2, spawnMaxX(w) - 2);
       candidate = makePlatform(nx, py, w, 16);
@@ -775,8 +1190,11 @@
 
     const dxLog = Math.round(Math.abs((candidate.x + candidate.w * 0.5) - anchorCx));
     const dyLog = Math.round(anchor.y - candidate.y);
+    const cxLog = candidate.x + candidate.w * 0.5;
     mainRouteRecent.push({ dx: dxLog, dy: dyLog, side: chosenSide });
     if (mainRouteRecent.length > 10) mainRouteRecent.shift();
+    mainCenterRecent.push(cxLog);
+    if (mainCenterRecent.length > 12) mainCenterRecent.shift();
     const dyMode = isMobile ? 'mobile' : 'desktop';
     const dyBucket = mainDyRecent[dyMode];
     dyBucket.push(dyLog);
@@ -806,31 +1224,33 @@
       const difficulty = clamp(climbNow / 4200, 0, 1);
       const earlyDense = clamp((10 - mainPlatformCount) / 10, 0, 1);
       const isMobile = isMobileMode();
-      const baseMinDy = clamp(lerp(MAIN_MIN_DY, MAIN_MIN_DY + 6, difficulty), 86, MAIN_MAX_DY - 16);
-      const baseMaxDy = clamp(lerp(MAIN_MAX_DY - 16, MAIN_MAX_DY, difficulty), baseMinDy + 16, MAIN_MAX_DY);
+      const baseMinDy = isMobile ? MAIN_DY_MOBILE_MIN : MAIN_DY_DESKTOP_MIN;
+      const baseMaxDy = isMobile ? MAIN_DY_MOBILE_MAX : MAIN_DY_DESKTOP_MAX;
       const safeTop = REACH_MAX_DY - 8;
-      const mobileScaledMin = clamp(baseMinDy * 1.18, MOBILE_MAIN_MIN_DY_HARD, safeTop - 20);
-      const mobileScaledMax = clamp(baseMaxDy * 1.35, mobileScaledMin + 10, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE));
+      const mobileScaledMin = clamp(baseMinDy, MOBILE_MAIN_MIN_DY_HARD, safeTop - 20);
+      const mobileScaledMax = clamp(baseMaxDy, mobileScaledMin + 10, Math.min(safeTop, MAIN_DY_MOBILE_MAX));
       const recent3 = mainDyRecent.mobile.slice(-3);
       const smallCount = recent3.filter((v) => v < 150).length;
       const forceLargeDy = isMobile && smallCount >= 2;
       const dyMin = isMobile
-        ? (forceLargeDy ? clamp(124, MOBILE_MAIN_MIN_DY_HARD, Math.min(safeTop - 10, MOBILE_MAIN_MAX_DY_SAFE - 10)) : mobileScaledMin)
+        ? (forceLargeDy ? clamp(164, MOBILE_MAIN_MIN_DY_HARD, Math.min(safeTop - 10, MAIN_DY_MOBILE_MAX - 10)) : mobileScaledMin)
         : baseMinDy;
       const dyMax = isMobile
-        ? (forceLargeDy ? clamp(150, dyMin + 4, Math.min(safeTop, MOBILE_MAIN_MAX_DY_SAFE)) : mobileScaledMax)
+        ? (forceLargeDy ? clamp(198, dyMin + 4, Math.min(safeTop, MAIN_DY_MOBILE_MAX)) : mobileScaledMax)
         : baseMaxDy;
 
       let main = null;
       let attempts = 0;
       const prevMainForRoute = lastMainPlatform ? { ...lastMainPlatform } : null;
-      const maxMainAttempts = isMobile
-        ? Math.max(MOBILE_MAIN_REROLL_MAX, CEILING_TRAP_REROLL_MAX)
-        : CEILING_TRAP_REROLL_MAX;
+      const maxMainAttempts = Math.max(PATH_VALIDATE_REROLL_MAX, CEILING_TRAP_REROLL_MAX);
       for (let i = 0; i < maxMainAttempts; i++){
         attempts = i + 1;
         const snapshot = snapshotMainGenState();
-        const dy = rand(dyMin, dyMax);
+        const dyBase = rand(dyMin, dyMax);
+        const fallbackScale = !isMobile
+          ? 1
+          : (i < 10 ? 1 : (i < 20 ? 0.9 : (i < 30 ? 0.8 : 0.7)));
+        const dy = clamp(dyBase * fallbackScale, isMobile ? MOBILE_MAIN_MIN_DY_HARD : baseMinDy, dyMax);
         nextPlatformY = anchorY - dy;
 
         const candidate = spawnMainPlatform(nextPlatformY, {
@@ -838,6 +1258,11 @@
           maxDy: dyMax,
           isMobile
         });
+        if (shouldRejectCandidate(candidate, isMobile, [], 'main-post-spawn')){
+          restoreMainGenState(snapshot);
+          if (isMobile) console.log('[main-mobile] reroll reason: overlap/stack');
+          continue;
+        }
         const actualDy = anchorY - candidate.y;
         const reachable = !snapshot.lastMainPlatform || isReachableFrom(snapshot.lastMainPlatform, candidate, difficulty);
         if (!reachable){
@@ -857,6 +1282,27 @@
             console.log(`CEILING_TRAP reroll=${attempts}/${maxMainAttempts}`);
             continue;
           }
+          const pathOk = existsPathUp(prevMainForRoute, difficulty, {
+            steps: PATH_VALIDATE_STEPS,
+            minGainY: PATH_VALIDATE_MIN_GAIN_Y,
+            extraPlatforms: [candidate]
+          });
+          if (!pathOk){
+            restoreMainGenState(snapshot);
+            if (isMobile) console.log('[main-mobile] reroll reason: no upward path chain');
+            continue;
+          }
+          const quality = evaluateMainRouteQuality(prevMainForRoute, candidate, difficulty, isMobile);
+          if (quality.total < MAIN_QUALITY_MIN_SCORE){
+            restoreMainGenState(snapshot);
+            if (isMobile) console.log(`[main-mobile] reroll reason: low quality score=${quality.total.toFixed(2)}`);
+            continue;
+          }
+          if (attempts <= Math.floor(maxMainAttempts * 0.75) && !quality.hasBothChoices){
+            restoreMainGenState(snapshot);
+            if (isMobile) console.log('[main-mobile] reroll reason: no dual-side choices');
+            continue;
+          }
         }
         main = candidate;
         break;
@@ -874,13 +1320,36 @@
         attempts = Math.max(attempts, isMobile ? MOBILE_MAIN_REROLL_MAX : 1);
       }
 
+      if (prevMainForRoute){
+        const pathStillValid = existsPathUp(prevMainForRoute, difficulty, {
+          steps: PATH_VALIDATE_STEPS,
+          minGainY: PATH_VALIDATE_MIN_GAIN_Y,
+          extraPlatforms: [main]
+        });
+        if (!pathStillValid){
+          const rescue = buildRescuePlatform(prevMainForRoute, difficulty, isMobile);
+          if (rescue){
+            addPlatform(rescue);
+            console.log('[main-route] rescue platform inserted (path validation fallback)');
+          }
+        }
+        const choices = getReachableSideChoices(prevMainForRoute, difficulty, [main], 1.5);
+        if (!choices.hasBoth){
+          const missingSide = choices.left ? 1 : -1;
+          const rescueSide = buildRescuePlatformOnSide(prevMainForRoute, difficulty, isMobile, missingSide);
+          if (rescueSide){
+            addPlatform(rescueSide);
+          }
+        }
+      }
+
       nextPlatformY = main.y;
       if (prevMainForRoute){
         const postTrap = detectCeilingTrap(prevMainForRoute, [main], isMobile, true);
         if (postTrap.trap){
           const rescue = buildRescuePlatform(prevMainForRoute, difficulty, isMobile);
           if (rescue){
-            platforms.push(rescue);
+            addPlatform(rescue);
           }
         }
       }
@@ -896,32 +1365,25 @@
         if (Math.random() < crumbleChance) main.crumble = true;
       }
       maybeAssignItem(main, difficulty);
-      platforms.push(main);
+      addPlatform(main);
 
       // 고도 상승 시에도 보조 발판 확률 하한을 높여 밀도 유지
       const subChanceBase = clamp(lerp(0.40, 0.22, difficulty) + earlyDense * 0.20, 0.18, 0.62);
-      const subChance = isMobile ? clamp(subChanceBase * 1.18, 0.30, 0.78) : subChanceBase;
+      const subChance = isMobile ? clamp(subChanceBase * 0.45, 0.06, 0.24) : clamp(subChanceBase * 0.75, 0.12, 0.48);
       const subRolls = isMobile ? MOBILE_SUB_ROLLS_MAX : 1;
       for (let subIndex = 0; subIndex < subRolls; subIndex++){
         if (Math.random() >= subChance) continue;
         const y = isMobile
           ? (nextPlatformY + rand(6, 26))
           : (nextPlatformY + rand(-18, 18));
-        let w = rand(lerp(96, 70, difficulty), lerp(130, 105, difficulty));
+        let w = rand(SUB_W_MIN, SUB_W_MAX);
         if (hasWidePlatformInYBand(y, 25, 0.42)){
           const playW = WORLD_MAX_X - WORLD_MIN_X;
           w = Math.min(w, playW * 0.38);
         }
         {
-          const playW = WORLD_MAX_X - WORLD_MIN_X;
-          const climbRatio = clamp(climbNow / 3600, 0, 1);
-          if (isMobile){
-            const cap = playW * lerp(MOBILE_SUB_MAX_W_SCREEN_RATIO, MOBILE_SUB_MAX_W_SCREEN_RATIO - 0.12, climbRatio);
-            w = Math.min(w, cap, playW * MOBILE_RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
-          } else {
-            const cap = playW * lerp(DESKTOP_SUB_MAX_W_SCREEN_RATIO, DESKTOP_SUB_MAX_W_SCREEN_RATIO - 0.10, climbRatio);
-            w = Math.min(w, cap, playW * RANDOM_PLATFORM_MAX_W_SCREEN_RATIO);
-          }
+          const hardCap = Math.min(SUB_W_MAX, getRandomPlatformMaxWidth(isMobile));
+          w = clamp(w, SUB_W_MIN, hardCap);
         }
         if (isMobile && countPlatformsInYBand(y, MOBILE_SUB_BAND_DY) >= MOBILE_SUB_BAND_MAX){
           continue;
@@ -946,24 +1408,26 @@
             : clamp(main.x + rand(240, 340), spawnMinX() + 2, spawnMaxX(w) - 2);
         }
         const sub = makePlatform(x, y, w, 14, { crumble: Math.random() < 0.34 && mainPlatformCount > 7 });
+        if (shouldRejectCandidate(sub, isMobile, [], 'sub-pre')) continue;
         if (isBlockingCeiling(main, sub)) continue;
         if (isMobile && isBlockingMainRoute(main, sub)) continue;
         if (isMobile && prevMainForRoute && blocksAscentPath(prevMainForRoute, main, sub, 12)) continue;
+        if (!hasWideFreeIntervalInYBand(sub.y, Y_BAND_HALF_RANGE, Y_BAND_FREE_MIN_W, [sub])) continue;
         if (isMobile && prevMainForRoute){
           const trap = detectCeilingTrap(prevMainForRoute, [sub], true, true);
           if (trap.trap) continue;
         }
-        let placeable = !overlapsAnyPlatform(sub, 8);
+        let placeable = !shouldRejectCandidate(sub, isMobile, [], 'sub-placeable');
         for (let tries = 0; tries < 10 && !placeable; tries++){
           sub.x = rand(spawnMinX() + 2, spawnMaxX(sub.w) - 2);
-          placeable = !overlapsAnyPlatform(sub, 8);
+          placeable = !shouldRejectCandidate(sub, isMobile, [], 'sub-retry');
         }
         if (placeable && isMobile){
           placeable = hasReachableAnchor(sub, difficulty) || isReachableFrom(main, sub, difficulty);
         }
         if (placeable){
           maybeAssignItem(sub, difficulty);
-          platforms.push(sub);
+          addPlatform(sub);
         }
       }
     }
@@ -975,10 +1439,14 @@
       const pl = platforms[i];
       if (pl.keep) continue;
       if (pl.broken){
+        removePlatformFromBuckets(pl);
         platforms.splice(i, 1);
         continue;
       }
-      if (pl.y > cutoffY) platforms.splice(i, 1);
+      if (pl.y > cutoffY){
+        removePlatformFromBuckets(pl);
+        platforms.splice(i, 1);
+      }
     }
   }
 
@@ -1085,6 +1553,55 @@
     for (let i = breakCrackFx.length - 1; i >= 0; i--){
       breakCrackFx[i].life -= dt;
       if (breakCrackFx[i].life <= 0) breakCrackFx.splice(i, 1);
+    }
+  }
+
+  function scanVisibleOverlapViolations(now){
+    if (!DEBUG_OVERLAP) return;
+    if (now - lastOverlapScanAt < 500) return;
+    lastOverlapScanAt = now;
+
+    const isMobile = isMobileMode();
+    const H = viewportH || Math.round(window.innerHeight);
+    const viewTop = cam.y - H * 0.2;
+    const viewBottom = cam.y + H * 1.2;
+    const dySoft = isMobile ? DY_SOFT_MOBILE : DY_SOFT_DESKTOP;
+    const minGapX = isMobile ? MIN_GAP_X_MOBILE : MIN_GAP_X_DESKTOP;
+    const stackDy = isMobile ? STACK_DY_MOBILE : STACK_DY_DESKTOP;
+    const visible = [];
+    for (const pl of platforms){
+      if (pl.broken) continue;
+      if (pl.y + pl.h < viewTop || pl.y > viewBottom) continue;
+      visible.push(pl);
+    }
+
+    for (let i = 0; i < visible.length; i++){
+      for (let j = i + 1; j < visible.length; j++){
+        const a = visible[i];
+        const b = visible[j];
+        const dy = Math.abs(a.y - b.y);
+        const aw = getWorldRect(a, isMobile);
+        const bw = getWorldRect(b, isMobile);
+        const as = getScreenRectFromWorldRect(aw);
+        const bs = getScreenRectFromWorldRect(bw);
+        const xOverlapPx = overlapWidth1D(as.left, as.right, bs.left, bs.right);
+        const xGap = Math.max(bs.left - as.right, as.left - bs.right);
+        const ratio = xOverlapPx / Math.max(1, Math.min(aw.right - aw.left, bw.right - bw.left));
+
+        const violated =
+          (dy < dySoft && xOverlapPx > 0)
+          || (dy < dySoft && xGap < minGapX)
+          || (dy < stackDy && ratio >= 0.10);
+        if (!violated) continue;
+
+        console.log(
+          `VIOLATION pair: ${a._id},${b._id} ` +
+          `worldRectA=${JSON.stringify(aw)} worldRectB=${JSON.stringify(bw)} ` +
+          `screenRectA=${JSON.stringify(as)} screenRectB=${JSON.stringify(bs)} ` +
+          `xOverlapPx=${Math.round(xOverlapPx)} dy=${Math.round(dy)} xGap=${Math.round(xGap)} ratio=${ratio.toFixed(2)}`
+        );
+        return;
+      }
     }
   }
 
@@ -2029,6 +2546,7 @@
     }
 
     render();
+    scanVisibleOverlapViolations(now);
     requestAnimationFrame(tick);
   }
 
